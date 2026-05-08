@@ -1044,54 +1044,6 @@ fn lens_clear_interactive_region(window: &WebviewWindow) {
 #[cfg(not(target_os = "windows"))]
 fn lens_clear_interactive_region(_window: &WebviewWindow) {}
 
-#[cfg(target_os = "windows")]
-fn lens_set_interactive_region(
-    window: &WebviewWindow,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-) -> Result<(), String> {
-    use ::windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, SetWindowRgn, HGDIOBJ};
-
-    let hwnd = window.hwnd().map_err(|e| e.to_string())?;
-    let scale = window.scale_factor().map_err(|e| e.to_string())?;
-    let left = (x * scale).round() as i32;
-    let top = (y * scale).round() as i32;
-    let right = ((x + width) * scale).round() as i32;
-    let bottom = ((y + height) * scale).round() as i32;
-
-    unsafe {
-        let region = CreateRectRgn(left, top, right.max(left + 1), bottom.max(top + 1));
-        if region.is_invalid() {
-            return Err("CreateRectRgn failed".to_string());
-        }
-        if SetWindowRgn(hwnd, Some(region), false) == 0 {
-            let _ = DeleteObject(HGDIOBJ(region.0));
-            return Err("SetWindowRgn failed".to_string());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn lens_set_interactive_region(
-    window: &WebviewWindow,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-) -> Result<(), String> {
-    if let (Ok(pos), Ok(scale)) = (window.outer_position(), window.scale_factor()) {
-        let _ = window.set_position(tauri::LogicalPosition::new(
-            (pos.x as f64 / scale) + x,
-            (pos.y as f64 / scale) + y,
-        ));
-    }
-    let _ = window.set_size(tauri::LogicalSize::new(width, height));
-    Ok(())
-}
-
 fn lens_position_text_floating(app: &AppHandle, window: &WebviewWindow) {
     const WIDTH: f64 = 640.0;
     const HEIGHT: f64 = 320.0;
@@ -2148,9 +2100,43 @@ fn lens_set_floating(app: AppHandle, rect: FloatingRect) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        if let (Some(x), Some(y)) = (rect.x, rect.y) {
-            lens_set_interactive_region(&window, x, y, rect.width, rect.height)?;
+        use ::windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER,
+        };
+
+        if let Ok(hwnd) = window.hwnd() {
+            let scale = window.scale_factor().unwrap_or(1.0);
+            let scale = if scale.is_finite() && scale > 0.0 {
+                scale
+            } else {
+                1.0
+            };
+            let width = (rect.width * scale).round().max(1.0) as i32;
+            let height = (rect.height * scale).round().max(1.0) as i32;
+            let flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER;
+
+            unsafe {
+                match (rect.x, rect.y) {
+                    (Some(x), Some(y)) => {
+                        let x = (x * scale).round() as i32;
+                        let y = (y * scale).round() as i32;
+                        SetWindowPos(hwnd, None, x, y, width, height, flags)
+                            .map_err(|e| format!("SetWindowPos(lens floating) failed: {e}"))?;
+                    }
+                    _ => {
+                        SetWindowPos(hwnd, None, 0, 0, width, height, flags | SWP_NOMOVE)
+                            .map_err(|e| format!("SetWindowPos(lens floating size) failed: {e}"))?;
+                    }
+                }
+            }
+        } else {
+            if let (Some(x), Some(y)) = (rect.x, rect.y) {
+                let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+            }
+            let _ = window.set_size(tauri::LogicalSize::new(rect.width, rect.height));
         }
+
+        lens_clear_interactive_region(&window);
     }
 
     #[cfg(not(target_os = "windows"))]

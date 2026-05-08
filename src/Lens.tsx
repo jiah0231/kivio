@@ -1172,10 +1172,17 @@ export default function Lens() {
             floatingRebaseTimerRef.current = null
             if (motionSeq !== motionSeqRef.current || stageRef.current === 'select') return
 
-            void api.lensSetFloating({ x: finalX - FLOATING_PADDING, y: finalY - FLOATING_PADDING, width: floatW, height: floatH })
+            const floatingOrigin = {
+              x: winOrigin.x + finalX - FLOATING_PADDING,
+              y: winOrigin.y + finalY - FLOATING_PADDING,
+            }
+            void api.lensSetFloating({ x: floatingOrigin.x, y: floatingOrigin.y, width: floatW, height: floatH })
               .then(() => {
                 if (motionSeq !== motionSeqRef.current || stageRef.current === 'select') return
                 flushSync(() => {
+                  setWinOrigin(floatingOrigin)
+                  setViewport({ w: floatW, h: floatH })
+                  setBarRect({ x: FLOATING_PADDING, y: FLOATING_PADDING, width: READY_W })
                   setFloatingRebased(true)
                   setBarIntro(true)
                 })
@@ -1613,6 +1620,15 @@ export default function Lens() {
     e.currentTarget.setPointerCapture(e.pointerId)
   }, [barRect, isFloatingLayout])
 
+  const handleFloatingPanelDragStart = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!isFloatingLayout || e.button !== 0) return
+    const target = e.target as HTMLElement | null
+    if (target?.closest('button,input,textarea,select,a,[role="button"],[data-no-window-drag="true"]')) return
+    e.preventDefault()
+    e.stopPropagation()
+    void api.startDragging().catch(err => console.error('[lens-drag] startDragging failed:', err))
+  }, [isFloatingLayout])
+
   const handleTranslateCardDragMove = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
     const drag = translateCardDragRef.current
     if (!drag || drag.pointerId !== e.pointerId) return
@@ -1694,7 +1710,10 @@ export default function Lens() {
       h = Math.max(h, READY_BAR_H + FLOATING_GAP + stableAnswerHeight + FLOATING_PADDING * 2)
     }
 
-    api.lensSetFloating({ x, y, width: w, height: h }).catch(err => console.error('[lens-floating] resize failed:', err))
+    const rect = floatingRebased && mode !== 'translateText'
+      ? { width: w, height: h }
+      : { x, y, width: w, height: h }
+    api.lensSetFloating(rect).catch(err => console.error('[lens-floating] resize failed:', err))
   }, [stage, answerLayout, barRect, floatingRebased, keepFullscreen, mode, stableAnswerHeight])
 
   return (
@@ -1884,6 +1903,7 @@ export default function Lens() {
         <div
           ref={barRef}
           className="absolute ease-out"
+          onPointerDown={handleFloatingPanelDragStart}
           onMouseDown={(e) => { if (stage !== 'select') e.stopPropagation() }}
           onMouseMove={(e) => { if (stage !== 'select') e.stopPropagation() }}
           onMouseUp={(e) => { if (stage !== 'select') e.stopPropagation() }}
