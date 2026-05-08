@@ -35,6 +35,7 @@ src-tauri/
     prompts.rs                # Default and composed prompt templates
     apple_intelligence.rs     # macOS Apple Intelligence sidecar client
     lens.rs                   # Lens window enumeration and screenshot capture
+    native_freeze.rs          # Windows native frozen-screen overlay for Lens capture
     screenshot.rs             # Screenshot capture utilities and temp file cleanup
     sck.rs                    # ScreenCaptureKit integration (macOS 14+)
     settings.rs               # Settings data structures, serialization, migration
@@ -88,6 +89,16 @@ The app supports separate OpenAI-compatible providers for each feature:
 
 Each `ModelProvider` has `id`, `name`, `base_url`, `api_keys`, `available_models`, and `enabled_models`.
 
+Provider `base_url` values may point either to a base OpenAI-compatible URL or directly to an endpoint:
+
+- Base URL: `https://api.example.com/v1` -> calls `/chat/completions` and `/models`
+- Chat Completions URL: `https://api.example.com/v1/chat/completions`
+- OpenAI Responses URL: `https://api.example.com/v1/responses`
+
+When a provider URL ends in `/responses`, `api.rs` converts chat-style messages into Responses API `input` items, parses Responses API normal and streaming output, and resolves model fetching by trimming back to `/models`.
+
+Lens has a `web_search_enabled` setting. It is only applied to Responses API requests, where the backend adds the web search tool and lets the model choose tool use automatically.
+
 ### API Key Failover
 
 - Each provider stores multiple API keys (`api_keys: string[]`)
@@ -106,7 +117,9 @@ Each `ModelProvider` has `id`, `name`, `base_url`, `api_keys`, `available_models
   - Dock icon is hidden (`ActivationPolicy::Accessory`)
   - `sck.rs` handles SCScreenshotManager integration with prewarming for performance
 - **Windows**:
-  - Region capture uses the `xcap` library's `Monitor::capture_region`, with the Lens fullscreen transparent overlay for frontend region selection
+  - Region capture still uses `xcap` for the final crop, but Lens selection can freeze the screen with `native_freeze.rs`
+  - `native_freeze.rs` uses Win32 GDI to capture the desktop into a native topmost overlay so large screenshots do not need to be pushed through WebView
+  - The frontend Lens overlay remains responsible for selection UI and final question/answer flow
   - Auto-paste uses `enigo` to simulate `Ctrl+V`
 
 ### HTTP API & Retry Logic
@@ -115,6 +128,8 @@ Each `ModelProvider` has `id`, `name`, `base_url`, `api_keys`, `available_models
 - All outbound API calls (translate, OCR, vision, fetch models, test connection) go through `send_with_retry`
 - Retry policy: exponential backoff for 429 / 5xx / timeout / connection errors; respects `Retry-After` headers
 - Retry count is controlled by `retry_enabled` and `retry_attempts` (1-5, default 3)
+- `api.rs` supports both Chat Completions SSE (`chat.completion.chunk`) and Responses API SSE events such as output text deltas/completion
+- Responses API web search is Lens-only for now and is controlled by `settings.lens.web_search_enabled`
 
 ### Lens Flow
 
@@ -124,9 +139,11 @@ Each `ModelProvider` has `id`, `name`, `base_url`, `api_keys`, `available_models
 4. Generate `image_id`, store temp image in `explain_images` map
 5. Open / reuse the `lens` window; frontend reads the image via `explain_read_image`
 6. User asks a question via `lens_ask` (streaming supported through `lens-stream`)
-7. Follow-up questions reuse the same `image_id` and recent messages
-8. History keeps the most recent 20 records, with thumbnails in `localStorage` and images in `lens-history`
-9. Supports pure-text questions without screenshot
+7. While answering, the UI shows the active model name so users can see which provider/model is responding
+8. Markdown answers support GFM rendering and code block copy buttons
+9. Follow-up questions reuse the same `image_id` and recent messages
+10. History keeps the most recent 20 records, with thumbnails in `localStorage` and images in `lens-history`
+11. Supports pure-text questions without screenshot
 
 ### Screenshot Translation Flow
 
@@ -173,6 +190,13 @@ Rust dependencies are managed by `cargo`; the Tauri CLI coordinates frontend and
 - `beforeBuildCommand`: `npm run build:ui`
 - `devUrl`: `http://localhost:5713`
 - `frontendDist`: `../dist`
+
+On Windows, `npm run build` creates local sidecar stubs in `src-tauri/binaries/` for the macOS-only Swift helpers:
+
+- `kivio-ai-helper-x86_64-pc-windows-msvc.exe`
+- `kivio-ocr-helper-x86_64-pc-windows-msvc.exe`
+
+These files satisfy Tauri `externalBin` validation on Windows. They are local build artifacts ignored by git and should not be committed. Release artifacts are written under `src-tauri/target/release/`, with installers under `src-tauri/target/release/bundle/msi/` and `src-tauri/target/release/bundle/nsis/`.
 
 ## Coding Style & Naming Conventions
 
