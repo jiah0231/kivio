@@ -272,6 +272,9 @@ pub struct LensConfig {
     /// false 时会向请求 body 注入各家厂商关闭思考的字段并集（不认识的会被 provider 忽略）。
     #[serde(default = "default_true")]
     pub thinking_enabled: bool,
+    /// Responses API 联网搜索开关。仅当 provider base_url 指向 /responses 时生效。
+    #[serde(default = "default_false")]
+    pub web_search_enabled: bool,
     /// 自定义 system prompt。空字符串使用 default_system_prompt 模板。
     #[serde(default)]
     pub system_prompt: String,
@@ -303,6 +306,7 @@ impl Default for LensConfig {
             default_language: String::new(),
             stream_enabled: true,
             thinking_enabled: true,
+            web_search_enabled: false,
             system_prompt: String::new(),
             question_prompt: String::new(),
             message_order: "asc".to_string(),

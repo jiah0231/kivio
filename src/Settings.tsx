@@ -680,6 +680,7 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
         defaultLanguage: '',
         streamEnabled: true,
         thinkingEnabled: true,
+        webSearchEnabled: false,
         systemPrompt: '',
         questionPrompt: '',
         messageOrder: 'asc' as const
@@ -1136,6 +1137,12 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
                         <Toggle
                           checked={settings.lens?.thinkingEnabled !== false}
                           onChange={(v) => updateLens({ thinkingEnabled: v })}
+                        />
+                      </SettingRow>
+                      <SettingRow label={t.lensWebSearchEnabled} description={t.lensWebSearchHint}>
+                        <Toggle
+                          checked={settings.lens?.webSearchEnabled === true}
+                          onChange={(v) => updateLens({ webSearchEnabled: v })}
                         />
                       </SettingRow>
                       <SettingRow label={t.lensMessageOrder}>

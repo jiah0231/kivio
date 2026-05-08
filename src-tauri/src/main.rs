@@ -6,6 +6,8 @@ mod apple_intelligence;
 mod lens;
 #[cfg(target_os = "macos")]
 mod macos_ocr;
+#[cfg(target_os = "windows")]
+mod native_freeze;
 mod prompts;
 mod rapidocr;
 #[cfg(target_os = "macos")]
@@ -41,8 +43,9 @@ use uuid::Uuid;
 
 use api::{
     build_http_client, build_ocr_request_body, call_openai_ocr, call_openai_text, call_vision_api,
-    effective_retry_attempts, resolve_provider_credentials, send_with_failover, send_with_retry,
-    stream_chat_call, stream_translate_combined, ProviderConnectionInput,
+    effective_retry_attempts, models_url_from_provider_url, resolve_provider_credentials,
+    send_with_failover, send_with_retry, stream_chat_call, stream_translate_combined,
+    ProviderConnectionInput,
 };
 use prompts::{
     build_combined_translate_prompt, build_ocr_direct_translation_prompt,
@@ -1133,6 +1136,52 @@ fn lens_position_text_floating(app: &AppHandle, window: &WebviewWindow) {
     ));
 }
 
+#[cfg(target_os = "windows")]
+fn lens_current_screen_space(app: &AppHandle) -> Option<native_freeze::ScreenSpace> {
+    let cursor = app.cursor_position().ok()?;
+    let monitors = app.available_monitors().ok()?;
+    let monitor = monitors.iter().find(|monitor| {
+        let mp = monitor.position();
+        let ms = monitor.size();
+        let right = mp.x + ms.width as i32;
+        let bottom = mp.y + ms.height as i32;
+        (cursor.x as i32) >= mp.x
+            && (cursor.x as i32) < right
+            && (cursor.y as i32) >= mp.y
+            && (cursor.y as i32) < bottom
+    })?;
+    let mp = monitor.position();
+    let ms = monitor.size();
+    let scale = monitor.scale_factor();
+    Some(native_freeze::ScreenSpace {
+        left: mp.x,
+        top: mp.y,
+        right: mp.x + ms.width as i32,
+        bottom: mp.y + ms.height as i32,
+        scale: if scale.is_finite() && scale > 0.0 { scale } else { 1.0 },
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn native_freeze_show_for_lens(window: &WebviewWindow, screen: native_freeze::ScreenSpace) {
+    let window_for_task = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        if let Err(err) = native_freeze::show(screen) {
+            eprintln!("[lens-freeze] native overlay failed: {err}");
+        }
+        native_freeze::place_lens_above(&window_for_task);
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn native_freeze_close_for_lens(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("lens") {
+        let _ = window.run_on_main_thread(native_freeze::close);
+    } else {
+        native_freeze::close();
+    }
+}
+
 /// 入口（公共底层）：打开 lens webview 进入 select 态。
 /// mode：
 ///   - "chat"（默认）：截完进对话栏 ready 态
@@ -1204,6 +1253,10 @@ fn lens_request_internal(app: &AppHandle, mode: &str) -> Result<(), String> {
         // 先在 hidden 状态下尝试定位：即便部分系统下 hidden 窗口 set_position 被忽略，也比
         // 不调强（成功则消除"先在旧位置闪一帧再跳到全屏"的可见跳变）。
         lens_position_fullscreen(app, &window);
+        #[cfg(target_os = "windows")]
+        if let Some(screen) = lens_current_screen_space(app) {
+            native_freeze_show_for_lens(&window, screen);
+        }
     }
     let _ = window.show();
     let _ = window.set_focus();
@@ -1212,6 +1265,8 @@ fn lens_request_internal(app: &AppHandle, mode: &str) -> Result<(), String> {
     } else {
         // show 后再调，处理 always_on_top + visible_on_all_workspaces 把首次 set_position 吃掉的情况
         lens_position_fullscreen(app, &window);
+        #[cfg(target_os = "windows")]
+        native_freeze::place_lens_above(&window);
     }
     Ok(())
 }
@@ -1295,6 +1350,30 @@ async fn lens_capture_region(
         }
     };
 
+    #[cfg(target_os = "windows")]
+    let result =
+        match native_freeze::capture_active_region_to_png(absolute_x, absolute_y, width, height) {
+            Ok(path) => {
+                native_freeze_close_for_lens(&app);
+                Ok(path)
+            }
+            Err(err) => {
+                eprintln!("[lens-freeze] crop from native overlay failed, fallback to xcap: {err}");
+                native_freeze_close_for_lens(&app);
+                capture_region_image(
+                    absolute_x,
+                    absolute_y,
+                    x,
+                    y,
+                    width,
+                    height,
+                    scale_factor,
+                    exclude_self_pid,
+                )
+            }
+        };
+
+    #[cfg(not(target_os = "windows"))]
     let result = capture_region_image(
         absolute_x,
         absolute_y,
@@ -1420,6 +1499,7 @@ async fn lens_ask(
         model_override.as_deref(),
         system_prompt_override.as_deref(),
         thinking_enabled,
+        settings.lens.web_search_enabled,
     )
     .await
     {
@@ -2025,6 +2105,8 @@ async fn local_ocr_then_translate(
 #[tauri::command]
 fn lens_close(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+    #[cfg(target_os = "windows")]
+    native_freeze_close_for_lens(&app);
     state
         .explain_stream_generation
         .fetch_add(1, Ordering::SeqCst);
@@ -2058,6 +2140,8 @@ struct FloatingRect {
 
 #[tauri::command]
 fn lens_set_floating(app: AppHandle, rect: FloatingRect) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    native_freeze_close_for_lens(&app);
     let Some(window) = app.get_webview_window("lens") else {
         return Ok(());
     };
@@ -2097,7 +2181,7 @@ async fn fetch_models(
         return Err("Missing API Key".to_string());
     }
 
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let url = models_url_from_provider_url(&base_url);
 
     let response = send_with_failover(
         &state,
@@ -2155,7 +2239,7 @@ async fn test_provider_connection(
     };
 
     let retry_attempts = effective_retry_attempts(&settings);
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let url = models_url_from_provider_url(&base_url);
     let result = send_with_retry("Provider API", retry_attempts, || {
         state.http.get(url.clone()).bearer_auth(&api_key).send()
     })

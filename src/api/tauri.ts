@@ -115,6 +115,7 @@ export type Settings = {
     streamEnabled?: boolean
     /** 思考模式开关（默认 true）。false 时 body 注入各厂商关闭思考的字段并集 */
     thinkingEnabled?: boolean
+    webSearchEnabled?: boolean
     systemPrompt?: string
     questionPrompt?: string
     /** 消息排序：'asc' 老到新（默认），'desc' 新到老 */

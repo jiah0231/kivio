@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { isValidElement, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { flushSync } from 'react-dom'
 import { Loader2, Copy, Check, Square, Image as ImageIcon, ArrowUp, History as HistoryIcon, ChevronDown, Brain, MousePointer2, Code, Eye } from 'lucide-react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { api, type LensStreamPayload, type LensTranslateStreamPayload, type LensWindowInfo, type ExplainMessage } from './api/tauri'
-import ReactMarkdown from 'react-markdown'
+import ReactMarkdown, { type Components } from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
@@ -41,6 +42,41 @@ type Arrow = {
 const ARROW_COLOR = '#ff3b30'
 const ARROW_MIN_DRAG_PX = 8
 const ARROW_HEAD_ANGLE_DEG = 30
+
+function reactNodeToText(node: ReactNode): string {
+  if (node == null || typeof node === 'boolean') return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(reactNodeToText).join('')
+  if (isValidElement<{ children?: ReactNode }>(node)) return reactNodeToText(node.props.children)
+  return ''
+}
+
+const MARKDOWN_COMPONENTS: Components = {
+  pre({ children, className, ...props }) {
+    const text = reactNodeToText(children).replace(/\n$/, '')
+    return (
+      <div className="not-prose group relative my-3 overflow-hidden rounded-xl border border-black/[0.08] bg-neutral-950 text-neutral-100 shadow-sm dark:border-white/[0.08]">
+        <button
+          type="button"
+          onClick={() => void copyToClipboard(text)}
+          className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-md bg-white/10 text-white/80 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-white/15"
+          title="Copy"
+          aria-label="Copy"
+        >
+          <Copy size={13} />
+        </button>
+        <pre {...props} className={`m-0 max-h-[360px] overflow-auto p-3.5 pr-12 text-[12px] leading-5 custom-scrollbar ${className ?? ''}`}>
+          {children}
+        </pre>
+      </div>
+    )
+  },
+}
+
+function formatLensAsking(template: string, model: string) {
+  return template.replace('{model}', model || 'AI')
+}
+
 type HistoryItem = {
   id: string                   // imageId（恢复时复用，重新提问会用同一张图）
   imagePreview: string         // base64 data URL
@@ -395,6 +431,7 @@ export default function Lens() {
   const [streaming, setStreaming] = useState(false)
   const [copied, setCopied] = useState(false)
   const [lang, setLang] = useState<Lang>('zh')
+  const [activeLensModel, setActiveLensModel] = useState('AI')
   const [messageOrder, setMessageOrder] = useState<'asc' | 'desc'>('asc')
   const [keepFullscreen, setKeepFullscreen] = useState(true)
   const [floatingRebased, setFloatingRebased] = useState(false)
@@ -525,6 +562,7 @@ export default function Lens() {
         const settings = await api.getSettings()
         setLang((settings.settingsLanguage as Lang) || 'zh')
         setMessageOrder(settings.lens?.messageOrder === 'desc' ? 'desc' : 'asc')
+        setActiveLensModel(settings.lens?.model || settings.translatorModel || 'AI')
         const curMode = readModeFromHash()
         const cfg = curMode === 'translate' ? settings.screenshotTranslation : settings.lens
         setKeepFullscreen(cfg?.keepFullscreenAfterCapture !== false)
@@ -615,6 +653,7 @@ export default function Lens() {
         const cfg = curMode === 'translate' || curMode === 'translateText' ? settings.screenshotTranslation : settings.lens
         setKeepFullscreen(cfg?.keepFullscreenAfterCapture !== false)
         captureHintEnabledRef.current = settings.lens?.showCaptureHint !== false
+        setActiveLensModel(settings.lens?.model || settings.translatorModel || 'AI')
         if (stageRef.current === 'select' && selectRevealedRef.current) {
           setShowCaptureHint(captureHintEnabledRef.current)
         }
@@ -2105,14 +2144,14 @@ export default function Lens() {
                                 {m.content}
                               </pre>
                             ) : (
-                              <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+                              <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={MARKDOWN_COMPONENTS}>
                                 {m.content}
                               </ReactMarkdown>
                             )
                           ) : isLast && streaming && !m.reasoning ? (
                             <div className="not-prose flex items-center gap-2 text-neutral-500 dark:text-neutral-400">
                               <Loader2 className="animate-spin" size={14} />
-                              <span className="text-[12px]">{t.lensAsking}</span>
+                              <span className="text-[12px]">{formatLensAsking(t.lensAsking, activeLensModel)}</span>
                             </div>
                           ) : null}
                         </div>
@@ -2209,7 +2248,7 @@ export default function Lens() {
                 {/* 译文区（主体）：合并模式下分隔符前的所有 delta 都属于这块，先于原文出现 */}
                 {translateText ? (
                   <div className="prose prose-sm dark:prose-invert max-w-none text-[13.5px] leading-7 text-neutral-800 dark:text-neutral-200">
-                    <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={MARKDOWN_COMPONENTS}>
                       {translateText}
                     </ReactMarkdown>
                   </div>
@@ -2225,7 +2264,7 @@ export default function Lens() {
                   <>
                     <div className="border-t border-black/[0.05] dark:border-white/[0.06] -mx-3.5 my-3" />
                     <div className="prose prose-sm dark:prose-invert max-w-none text-[12.5px] leading-6 text-neutral-500 dark:text-neutral-400">
-                      <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+                      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={MARKDOWN_COMPONENTS}>
                         {translateOriginal}
                       </ReactMarkdown>
                     </div>

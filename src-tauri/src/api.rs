@@ -33,6 +33,217 @@ use crate::settings::{
 };
 use crate::state::AppState;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelEndpointKind {
+  ChatCompletions,
+  Responses,
+  LegacyBase,
+}
+
+fn normalized_provider_url(url: &str) -> String {
+  url.trim().trim_end_matches('/').to_string()
+}
+
+fn provider_endpoint_kind(url: &str) -> ModelEndpointKind {
+  let normalized = normalized_provider_url(url).to_ascii_lowercase();
+  if normalized.ends_with("/responses") {
+    ModelEndpointKind::Responses
+  } else if normalized.ends_with("/chat/completions") {
+    ModelEndpointKind::ChatCompletions
+  } else {
+    ModelEndpointKind::LegacyBase
+  }
+}
+
+fn chat_completions_url(url: &str) -> String {
+  let normalized = normalized_provider_url(url);
+  if provider_endpoint_kind(&normalized) == ModelEndpointKind::ChatCompletions {
+    normalized
+  } else {
+    format!("{normalized}/chat/completions")
+  }
+}
+
+fn responses_api_url(url: &str) -> String {
+  let normalized = normalized_provider_url(url);
+  if provider_endpoint_kind(&normalized) == ModelEndpointKind::Responses {
+    normalized
+  } else {
+    format!("{normalized}/responses")
+  }
+}
+
+pub fn models_url_from_provider_url(url: &str) -> String {
+  let normalized = normalized_provider_url(url);
+  let lower = normalized.to_ascii_lowercase();
+  let base = if lower.ends_with("/chat/completions") {
+    &normalized[..normalized.len() - "/chat/completions".len()]
+  } else if lower.ends_with("/responses") {
+    &normalized[..normalized.len() - "/responses".len()]
+  } else {
+    normalized.as_str()
+  };
+  format!("{base}/models")
+}
+
+fn responses_role(role: &str) -> &'static str {
+  match role {
+    "system" | "developer" => "developer",
+    "assistant" => "assistant",
+    _ => "user",
+  }
+}
+
+fn responses_input_text(text: impl Into<String>) -> serde_json::Value {
+  serde_json::json!({ "type": "input_text", "text": text.into() })
+}
+
+fn responses_output_text(text: impl Into<String>) -> serde_json::Value {
+  serde_json::json!({ "type": "output_text", "text": text.into() })
+}
+
+fn responses_input_image(url: impl Into<String>) -> serde_json::Value {
+  serde_json::json!({ "type": "input_image", "image_url": url.into() })
+}
+
+fn responses_text_content_for_role(role: &str, text: impl Into<String>) -> serde_json::Value {
+  if role == "assistant" {
+    responses_output_text(text)
+  } else {
+    responses_input_text(text)
+  }
+}
+
+fn responses_text_message(role: &str, text: impl Into<String>) -> serde_json::Value {
+  serde_json::json!({
+    "role": responses_role(role),
+    "content": [responses_text_content_for_role(responses_role(role), text)]
+  })
+}
+
+fn responses_tools(web_search: bool) -> serde_json::Value {
+  if web_search {
+    serde_json::json!([{ "type": "web_search" }])
+  } else {
+    serde_json::json!([])
+  }
+}
+
+fn apply_responses_web_search(body: &mut serde_json::Value, web_search: bool) {
+  if web_search {
+    body["tools"] = responses_tools(true);
+    body["tool_choice"] = serde_json::json!("auto");
+  }
+}
+
+fn apply_responses_reasoning(body: &mut serde_json::Value, thinking_enabled: bool) {
+  if !thinking_enabled {
+    body["reasoning"] = serde_json::json!({ "effort": "low" });
+  }
+}
+
+fn chat_content_to_responses_content(
+  role: &str,
+  content: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+  if let Some(text) = content.as_str() {
+    return vec![responses_text_content_for_role(role, text)];
+  }
+
+  let mut items = Vec::new();
+  if let Some(array) = content.as_array() {
+    for item in array {
+      let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+      match item_type {
+        "text" | "input_text" | "output_text" => {
+          if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+            items.push(responses_text_content_for_role(role, text));
+          }
+        }
+        "image_url" | "input_image" => {
+          if role == "assistant" {
+            continue;
+          }
+          let url = item
+            .get("image_url")
+            .and_then(|v| {
+              v.as_str()
+                .or_else(|| v.get("url").and_then(|url| url.as_str()))
+            })
+            .or_else(|| item.get("image_url").and_then(|v| v.get("image_url")).and_then(|v| v.as_str()))
+            .or_else(|| item.get("url").and_then(|v| v.as_str()));
+          if let Some(url) = url {
+            items.push(responses_input_image(url));
+          }
+        }
+        _ => {}
+      }
+    }
+  }
+  items
+}
+
+fn chat_messages_to_responses_input(messages: &serde_json::Value) -> serde_json::Value {
+  let input = messages
+    .as_array()
+    .map(|items| {
+      items
+        .iter()
+        .filter_map(|message| {
+          let role = message
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(responses_role)
+            .unwrap_or("user");
+          let content = chat_content_to_responses_content(
+            role,
+            message.get("content").unwrap_or(&serde_json::Value::Null),
+          );
+          if content.is_empty() {
+            None
+          } else {
+            Some(serde_json::json!({ "role": role, "content": content }))
+          }
+        })
+        .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+  serde_json::json!(input)
+}
+
+fn response_output_text(value: &serde_json::Value) -> Option<String> {
+  if let Some(text) = value.get("output_text").and_then(|v| v.as_str()) {
+    return Some(text.to_string());
+  }
+  let mut out = String::new();
+  if let Some(items) = value.get("output").and_then(|v| v.as_array()) {
+    for item in items {
+      if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+        for part in content {
+          if let Some(text) = part
+            .get("text")
+            .or_else(|| part.get("output_text"))
+            .and_then(|v| v.as_str())
+          {
+            out.push_str(text);
+          }
+        }
+      }
+    }
+  }
+  if out.trim().is_empty() { None } else { Some(out) }
+}
+
+fn parse_response_output_text(
+  raw: &str,
+  value: &serde_json::Value,
+  label: &str,
+) -> Result<String, String> {
+  response_output_text(value)
+    .map(|s| s.trim().to_string())
+    .ok_or_else(|| format!("Invalid {label} response: {}", raw.chars().take(500).collect::<String>()))
+}
+
 // ===== Provider 凭据 =====
 
 /// 供应商连接输入参数，用于测试连接或获取模型列表时临时传入
@@ -336,7 +547,38 @@ pub async fn call_openai_text(
   if model.trim().is_empty() {
     return Err("Please select a model first".to_string());
   }
-  let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+  if provider_endpoint_kind(&config.base_url) == ModelEndpointKind::Responses {
+    let url = responses_api_url(&config.base_url);
+    let mut body = serde_json::json!({
+      "model": model,
+      "input": [responses_text_message("user", prompt.clone())],
+      "max_output_tokens": 2000
+    });
+    apply_responses_reasoning(&mut body, thinking_enabled);
+
+    let response = send_with_failover(
+      state,
+      "OpenAI Responses",
+      retry_attempts,
+      &config.id,
+      &config.api_keys,
+      |key| {
+        state
+          .http
+          .post(url.clone())
+          .bearer_auth(key)
+          .json(&body)
+          .send()
+      },
+    )
+    .await?;
+    let raw = response.text().await.map_err(|e| format!("OpenAI Responses read body: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+      .map_err(|e| format!("OpenAI Responses parse JSON: {} (body: {})", e, raw.chars().take(500).collect::<String>()))?;
+    return parse_response_output_text(&raw, &value, "OpenAI Responses");
+  }
+
+  let url = chat_completions_url(&config.base_url);
   let mut body = serde_json::json!({
     "model": model,
     "messages": [{ "role": "user", "content": prompt }],
@@ -395,7 +637,53 @@ pub async fn call_openai_ocr(
   }
   let bytes = fs::read(image_path).map_err(|e| e.to_string())?;
   let base64 = general_purpose::STANDARD.encode(bytes);
-  let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+  if provider_endpoint_kind(&config.base_url) == ModelEndpointKind::Responses {
+    let url = responses_api_url(&config.base_url);
+    let mut body = serde_json::json!({
+      "model": model,
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            responses_input_image(format!("data:image/png;base64,{base64}")),
+            responses_input_text(prompt)
+          ]
+        }
+      ],
+      "max_output_tokens": 2000
+    });
+    apply_responses_reasoning(&mut body, thinking_enabled);
+
+    let response = send_with_failover(
+      state,
+      "OpenAI OCR",
+      retry_attempts,
+      &config.id,
+      &config.api_keys,
+      |key| {
+        state
+          .http
+          .post(url.clone())
+          .bearer_auth(key)
+          .json(&body)
+          .send()
+      },
+    )
+    .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+      let body_text = response.text().await.unwrap_or_default();
+      let snippet: String = body_text.chars().take(500).collect();
+      return Err(format!("OCR HTTP {}: {}", status.as_u16(), snippet));
+    }
+    let raw = response.text().await.map_err(|e| format!("OCR read body: {}", e))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+      .map_err(|e| format!("OCR parse JSON: {} (body: {})", e, raw.chars().take(500).collect::<String>()))?;
+    return parse_response_output_text(&raw, &value, "OCR");
+  }
+
+  let url = chat_completions_url(&config.base_url);
 
   // 与 lens 的 vision body 对齐：image 在 text 前、显式 max_tokens。
   // thinking 按调用方传入：截图翻译默认 false（节省时间），lens 默认 true。
@@ -480,6 +768,7 @@ pub async fn call_vision_api(
   model_override: Option<&str>,
   system_prompt_override: Option<&str>,
   thinking_enabled: bool,
+  web_search_enabled: bool,
 ) -> Result<String, String> {
   let settings = state.settings_read().clone();
   let provider_id = provider_id_override
@@ -550,13 +839,28 @@ pub async fn call_vision_api(
   if model.trim().is_empty() {
     return Err("Please select a model first".to_string());
   }
-  let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
+  let use_responses = provider_endpoint_kind(&provider.base_url) == ModelEndpointKind::Responses;
+  let url = if use_responses {
+    responses_api_url(&provider.base_url)
+  } else {
+    chat_completions_url(&provider.base_url)
+  };
   let mut body = serde_json::json!({
     "model": model,
     "messages": api_messages,
     "temperature": 0.7,
     "max_tokens": 2000
   });
+  if use_responses {
+    let input = chat_messages_to_responses_input(&body["messages"]);
+    body = serde_json::json!({
+      "model": model,
+      "input": input,
+      "max_output_tokens": 2000
+    });
+    apply_responses_web_search(&mut body, web_search_enabled);
+    apply_responses_reasoning(&mut body, thinking_enabled);
+  }
   if stream {
     body["stream"] = serde_json::json!(true);
   }
@@ -565,7 +869,7 @@ pub async fn call_vision_api(
   // 不再注入 chat_template_kwargs / enable_thinking / reasoning_effort —— 这些是 vLLM/Qwen/OpenAI
   // 私有字段，第三方代理（如 OpenRouter / 反代）做严格校验时会以 400 拒绝整个请求（实测 DeepSeek
   // 路径上 chat_template_kwargs 直接报错）。提示词层的 no-think 指令是更稳的兜底。
-  if !thinking_enabled {
+  if !use_responses && !thinking_enabled {
     body["thinking"] = serde_json::json!({ "type": "disabled" });
   }
 
@@ -600,6 +904,18 @@ pub async fn call_vision_api(
       .explain_stream_generation
       .fetch_add(1, Ordering::SeqCst)
       + 1;
+    if use_responses {
+      return stream_responses_response(
+        app,
+        response,
+        image_id,
+        stream_kind,
+        event_name,
+        &state.explain_stream_generation,
+        generation,
+      )
+      .await;
+    }
     return stream_vision_response(
       app,
       response,
@@ -616,6 +932,9 @@ pub async fn call_vision_api(
   let raw = response.text().await.map_err(|e| format!("Vision API read body: {}", e))?;
   let value: serde_json::Value = serde_json::from_str(&raw)
     .map_err(|e| format!("Vision API parse JSON: {} (body: {})", e, raw.chars().take(500).collect::<String>()))?;
+  if use_responses {
+    return parse_response_output_text(&raw, &value, "Vision API");
+  }
   let content = value
     .get("choices")
     .and_then(|choices| choices.get(0))
@@ -677,7 +996,20 @@ pub async fn stream_chat_call(
     return Err("Please select a model first".to_string());
   }
   body["model"] = serde_json::json!(model);
-  let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
+  let use_responses = provider_endpoint_kind(&provider.base_url) == ModelEndpointKind::Responses;
+  let url = if use_responses {
+    let input = chat_messages_to_responses_input(body.get("messages").unwrap_or(&serde_json::Value::Null));
+    let responses_body = serde_json::json!({
+      "model": model,
+      "input": input,
+      "stream": true,
+      "max_output_tokens": body.get("max_tokens").cloned().unwrap_or_else(|| serde_json::json!(2000))
+    });
+    body = responses_body;
+    responses_api_url(&provider.base_url)
+  } else {
+    chat_completions_url(&provider.base_url)
+  };
 
   let response = send_with_failover(
     state,
@@ -707,6 +1039,18 @@ pub async fn stream_chat_call(
     .explain_stream_generation
     .fetch_add(1, Ordering::SeqCst)
     + 1;
+  if use_responses {
+    return stream_responses_response(
+      app,
+      response,
+      image_id,
+      kind,
+      event_name,
+      &state.explain_stream_generation,
+      generation,
+    )
+    .await;
+  }
   stream_vision_response(
     app,
     response,
@@ -1046,6 +1390,223 @@ pub async fn stream_vision_response(
           event_name,
           serde_json::json!({ "imageId": image_id, "kind": kind, "delta": content }),
         );
+      }
+    }
+  }
+
+  emit_done("done", full.trim());
+  Ok(full.trim().to_string())
+}
+
+fn response_stream_delta_text(value: &serde_json::Value) -> Option<String> {
+  value
+    .get("delta")
+    .or_else(|| value.get("text"))
+    .and_then(|v| v.as_str())
+    .map(str::to_string)
+    .or_else(|| {
+      value
+        .get("item")
+        .and_then(|item| item.get("content"))
+        .and_then(|content| content.as_array())
+        .map(|parts| {
+          parts
+            .iter()
+            .filter_map(|part| {
+              part
+                .get("text")
+                .or_else(|| part.get("output_text"))
+                .and_then(|v| v.as_str())
+            })
+            .collect::<String>()
+        })
+        .filter(|text| !text.is_empty())
+    })
+}
+
+fn response_stream_done_text(value: &serde_json::Value) -> Option<String> {
+  value
+    .get("text")
+    .or_else(|| value.get("output_text"))
+    .and_then(|v| v.as_str())
+    .map(str::to_string)
+    .or_else(|| value.get("response").and_then(response_output_text))
+    .or_else(|| response_output_text(value))
+}
+
+async fn emit_responses_text_delta(
+  app: &AppHandle,
+  event_name: &str,
+  image_id: &str,
+  kind: &str,
+  full: &mut String,
+  delta: &str,
+) {
+  if delta.is_empty() {
+    return;
+  }
+  full.push_str(delta);
+  let _ = app.emit(
+    event_name,
+    serde_json::json!({ "imageId": image_id, "kind": kind, "delta": delta }),
+  );
+}
+
+async fn emit_responses_reasoning_delta(
+  app: &AppHandle,
+  event_name: &str,
+  image_id: &str,
+  kind: &str,
+  delta: &str,
+) {
+  if delta.is_empty() {
+    return;
+  }
+  let _ = app.emit(
+    event_name,
+    serde_json::json!({
+      "imageId": image_id,
+      "kind": kind,
+      "delta": "",
+      "reasoningDelta": delta,
+    }),
+  );
+}
+
+/// 流式解析 OpenAI Responses API 的 SSE 响应。
+pub async fn stream_responses_response(
+  app: &AppHandle,
+  mut response: reqwest::Response,
+  image_id: &str,
+  kind: &str,
+  event_name: &str,
+  generation_atom: &AtomicU64,
+  my_generation: u64,
+) -> Result<String, String> {
+  let mut buffer = String::new();
+  let mut full = String::new();
+  let mut web_search_notice_emitted = false;
+  let mut sse_event_type = String::new();
+
+  let emit_done = |reason: &str, full_text: &str| {
+    let _ = app.emit(
+      event_name,
+      serde_json::json!({
+        "imageId": image_id,
+        "kind": kind,
+        "delta": "",
+        "done": true,
+        "reason": reason,
+        "full": full_text,
+      }),
+    );
+  };
+
+  loop {
+    if generation_atom.load(Ordering::SeqCst) != my_generation {
+      emit_done("cancelled", full.trim());
+      return Ok(full.trim().to_string());
+    }
+
+    let chunk = match response.chunk().await {
+      Ok(Some(c)) => c,
+      Ok(None) => break,
+      Err(e) => {
+        emit_done("error", full.trim());
+        return Err(format!("Responses stream read body: {e}"));
+      }
+    };
+
+    buffer.push_str(&String::from_utf8_lossy(&chunk));
+    while let Some(pos) = buffer.find('\n') {
+      let line: String = buffer.drain(..=pos).collect();
+      let line = line.trim();
+      if let Some(event_type) = line.strip_prefix("event:") {
+        sse_event_type = event_type.trim().to_string();
+        continue;
+      }
+      if !line.starts_with("data:") {
+        continue;
+      }
+      let data = line.trim_start_matches("data:").trim();
+      if data.is_empty() {
+        continue;
+      }
+      if data == "[DONE]" {
+        emit_done("done", full.trim());
+        return Ok(full.trim().to_string());
+      }
+
+      let value: serde_json::Value = match serde_json::from_str(data) {
+        Ok(val) => val,
+        Err(_) => continue,
+      };
+      let event_type_owned = value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or(sse_event_type.as_str())
+        .to_string();
+      sse_event_type.clear();
+
+      if !web_search_notice_emitted {
+        let item_type = value
+          .get("item")
+          .and_then(|item| item.get("type"))
+          .and_then(|v| v.as_str())
+          .unwrap_or("");
+        if event_type_owned.contains("web_search") || item_type.contains("web_search") {
+          web_search_notice_emitted = true;
+          emit_responses_reasoning_delta(
+            app,
+            event_name,
+            image_id,
+            kind,
+            "正在联网搜索...\n",
+          )
+          .await;
+        }
+      }
+
+      match event_type_owned.as_str() {
+        event if event.contains("output_text.delta") || event.contains("response.text.delta") => {
+          if let Some(delta) = response_stream_delta_text(&value) {
+            emit_responses_text_delta(app, event_name, image_id, kind, &mut full, &delta).await;
+          }
+        }
+        event if event.contains("reasoning") && event.contains("delta") => {
+          if let Some(delta) = response_stream_delta_text(&value) {
+            emit_responses_reasoning_delta(app, event_name, image_id, kind, &delta).await;
+          }
+        }
+        "response.output_text.done" | "response.text.done" | "response.content_part.done" => {
+          if let Some(text) = response_stream_done_text(&value) {
+            let delta = text.strip_prefix(&full).unwrap_or(&text);
+            emit_responses_text_delta(app, event_name, image_id, kind, &mut full, delta).await;
+          }
+        }
+        "response.completed" => {
+          if full.trim().is_empty() {
+            if let Some(text) = value.get("response").and_then(response_output_text) {
+              emit_responses_text_delta(app, event_name, image_id, kind, &mut full, &text).await;
+            }
+          }
+          emit_done("done", full.trim());
+          return Ok(full.trim().to_string());
+        }
+        "response.failed" | "response.incomplete" | "error" => {
+          let message = value
+            .get("error")
+            .or_else(|| value.get("response").and_then(|v| v.get("error")))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| value.to_string());
+          emit_done("error", full.trim());
+          return Err(format!("Responses stream error: {}", message.chars().take(500).collect::<String>()));
+        }
+        _ => {
+          if let Some(delta) = response_stream_delta_text(&value) {
+            emit_responses_text_delta(app, event_name, image_id, kind, &mut full, &delta).await;
+          }
+        }
       }
     }
   }
