@@ -1176,16 +1176,18 @@ export default function Lens() {
               x: winOrigin.x + finalX - FLOATING_PADDING,
               y: winOrigin.y + finalY - FLOATING_PADDING,
             }
+            flushSync(() => {
+              setWinOrigin(floatingOrigin)
+              setViewport({ w: floatW, h: floatH })
+              setBarRect({ x: FLOATING_PADDING, y: FLOATING_PADDING, width: READY_W })
+              setFloatingRebased(true)
+              setBarIntro(true)
+              setBarNoTransition(true)
+              setFlyDelta({ x: 0, y: 0 })
+            })
             void api.lensSetFloating({ x: floatingOrigin.x, y: floatingOrigin.y, width: floatW, height: floatH })
               .then(() => {
                 if (motionSeq !== motionSeqRef.current || stageRef.current === 'select') return
-                flushSync(() => {
-                  setWinOrigin(floatingOrigin)
-                  setViewport({ w: floatW, h: floatH })
-                  setBarRect({ x: FLOATING_PADDING, y: FLOATING_PADDING, width: READY_W })
-                  setFloatingRebased(true)
-                  setBarIntro(true)
-                })
                 requestAnimationFrame(() => {
                   if (motionSeq === motionSeqRef.current) setBarNoTransition(false)
                 })
