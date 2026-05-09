@@ -96,6 +96,7 @@ const ANCHOR_GAP = 12              // 对话栏与选区之间的水平间距
 const DRAG_THRESHOLD = 5
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
 const TRANSITION_MS = 380
+const NATIVE_FLOATING_FLY_MS = 260
 const SELECT_REVEAL_DELAY_MS = 80
 const FLOATING_PADDING = 0
 const FLOATING_GAP = 8
@@ -466,6 +467,7 @@ export default function Lens() {
   // 最终位置，用 transform: translate(dx, dy) 把视觉位置拉回起点，下一帧再把 delta 过渡到 (0,0)。
   // transform 走合成层，不阻塞主线程，多窗口会话间稳定。
   const [flyDelta, setFlyDelta] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
+  const [barRebaseHidden, setBarRebaseHidden] = useState(false)
   const [translateCardDragging, setTranslateCardDragging] = useState(false)
   // capturedFrame：保留最后一次截图选区/窗口的高亮框，作为"已截图"视觉标记，ready/answering 态继续显示
   const [capturedFrame, setCapturedFrame] = useState<CapturedFrame | null>(null)
@@ -615,6 +617,7 @@ export default function Lens() {
       setStage(curMode === 'translateText' ? 'translating' : 'select')
       setMode(curMode)
       setFloatingRebased(false)
+      setBarRebaseHidden(false)
       setHovered(null)
       setDragStart(null)
       setDragCurrent(null)
@@ -931,6 +934,7 @@ export default function Lens() {
       setBarNoTransition(true)
       setStage('select')
       setFloatingRebased(false)
+      setBarRebaseHidden(false)
       setHovered(null)
       setDragStart(null)
       setDragCurrent(null)
@@ -1138,79 +1142,82 @@ export default function Lens() {
     const targetStage: Stage = mode === 'translate' ? 'translating' : 'ready'
 
     if (!keepFullscreen) {
-      // Keep the same visual path as fullscreen mode: the native WebView stays
-      // fullscreen, while Rust clips the window region to the floating card area.
+      // Floating mode uses native window movement. Resizing WebView2 from fullscreen
+      // after a CSS fly causes a compositor blank frame on Windows.
       fullscreenMetricsRef.current = metrics
       const finalX = Math.round(targetX)
       const finalY = Math.round(targetY)
-      const startX = barRect.x
-      const startY = barRect.y
       const floatW = READY_W + FLOATING_PADDING * 2
       const floatH = targetStage === 'ready'
         ? READY_BAR_H + FLOATING_PADDING * 2
         : READY_BAR_H + FLOATING_GAP + metrics.ANSWER_H + FLOATING_PADDING * 2
       const isTranslateMode = mode === 'translate'
+      const fromOrigin = {
+        x: Math.round(winOrigin.x + barRect.x - FLOATING_PADDING),
+        y: Math.round(winOrigin.y + barRect.y - FLOATING_PADDING),
+      }
+      const targetOrigin = {
+        x: Math.round(winOrigin.x + finalX - FLOATING_PADDING),
+        y: Math.round(winOrigin.y + finalY - FLOATING_PADDING),
+      }
 
       flushSync(() => {
         setAppLabel(label)
         setFloatingRebased(false)
+        setBarRebaseHidden(true)
         setBarNoTransition(true)
-        setBarRect({ x: finalX, y: finalY, width: READY_W })
-        setFlyDelta({ x: startX - finalX, y: startY - finalY })
+        setBarRect({ x: FLOATING_PADDING, y: FLOATING_PADDING, width: READY_W })
+        setFlyDelta({ x: 0, y: 0 })
         setStage(targetStage)
-        setBarIntro(!isTranslateMode)
+        setBarIntro(true)
       })
 
       if (floatingRebaseTimerRef.current) clearTimeout(floatingRebaseTimerRef.current)
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (motionSeq !== motionSeqRef.current) return
+
+      try {
+        await api.lensSetFloating({ x: fromOrigin.x, y: fromOrigin.y, width: floatW, height: floatH })
+        if (motionSeq !== motionSeqRef.current || (stageRef.current as Stage) === 'select') return
+        flushSync(() => {
+          setWinOrigin(fromOrigin)
+          setViewport({ w: floatW, h: floatH })
+          setBarRect({ x: FLOATING_PADDING, y: FLOATING_PADDING, width: READY_W })
+          setFloatingRebased(true)
+          setBarRebaseHidden(false)
+          setBarIntro(true)
+          setBarNoTransition(true)
+          setFlyDelta({ x: 0, y: 0 })
+        })
+        await api.lensFlyFloating({
+          from: fromOrigin,
+          to: targetOrigin,
+          width: floatW,
+          height: floatH,
+          durationMs: isTranslateMode ? 80 : NATIVE_FLOATING_FLY_MS,
+        })
+        if (motionSeq !== motionSeqRef.current || stageRef.current === 'select') return
+        flushSync(() => {
+          setWinOrigin(targetOrigin)
+          setViewport({ w: floatW, h: floatH })
+          setBarRect({ x: FLOATING_PADDING, y: FLOATING_PADDING, width: READY_W })
+          setFloatingRebased(true)
+          setBarRebaseHidden(false)
           setBarNoTransition(false)
           setFlyDelta({ x: 0, y: 0 })
-
-          floatingRebaseTimerRef.current = window.setTimeout(() => {
-            floatingRebaseTimerRef.current = null
-            if (motionSeq !== motionSeqRef.current || stageRef.current === 'select') return
-
-            const floatingOrigin = {
-              x: winOrigin.x + finalX - FLOATING_PADDING,
-              y: winOrigin.y + finalY - FLOATING_PADDING,
-            }
-            flushSync(() => {
-              setWinOrigin(floatingOrigin)
-              setViewport({ w: floatW, h: floatH })
-              setBarRect({ x: FLOATING_PADDING, y: FLOATING_PADDING, width: READY_W })
-              setFloatingRebased(true)
-              setBarIntro(true)
-              setBarNoTransition(true)
-              setFlyDelta({
-                x: finalX - FLOATING_PADDING,
-                y: finalY - FLOATING_PADDING,
-              })
-            })
-            void api.lensSetFloating({ x: floatingOrigin.x, y: floatingOrigin.y, width: floatW, height: floatH })
-              .then(() => {
-                if (motionSeq !== motionSeqRef.current || stageRef.current === 'select') return
-                flushSync(() => {
-                  setFlyDelta({ x: 0, y: 0 })
-                })
-              })
-              .catch((err: unknown) => {
-                console.error('[lens] lensSetFloating rebase failed:', err)
-                if (motionSeq !== motionSeqRef.current) return
-                flushSync(() => {
-                  setFloatingRebased(false)
-                  setBarNoTransition(true)
-                  setBarRect({ x: finalX, y: finalY, width: READY_W })
-                  setBarIntro(true)
-                })
-                requestAnimationFrame(() => {
-                  if (motionSeq === motionSeqRef.current) setBarNoTransition(false)
-                })
-              })
-          }, isTranslateMode ? 0 : TRANSITION_MS + 40)
         })
-      })
+      } catch (err) {
+        console.error('[lens] native floating fly failed:', err)
+        if (motionSeq !== motionSeqRef.current) return
+        flushSync(() => {
+          setFloatingRebased(false)
+          setBarRebaseHidden(false)
+          setBarNoTransition(true)
+          setBarRect({ x: finalX, y: finalY, width: READY_W })
+          setBarIntro(true)
+        })
+        requestAnimationFrame(() => {
+          if (motionSeq === motionSeqRef.current) setBarNoTransition(false)
+        })
+      }
     } else {
       // 全屏模式：left/top 立即 snap 到最终位置（snap 时 barNoTransition=true 抑制 transition），
       // 视觉上的"起点"由 transform: translate(startDelta) 提供，再于下一帧把 delta 过渡到 (0,0)。
@@ -1922,6 +1929,8 @@ export default function Lens() {
             transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)',
             transform: `translate3d(${flyDelta.x}px, ${flyDelta.y}px, 0) scale(${barIntro ? 1 : 0.92})`,
             opacity: barIntro ? 1 : 0,
+            visibility: barRebaseHidden ? 'hidden' : undefined,
+            pointerEvents: barRebaseHidden ? 'none' : undefined,
             willChange: 'transform, opacity',
           }}
         >
@@ -2212,6 +2221,8 @@ export default function Lens() {
             transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)',
             transform: barIntro ? 'scale(1)' : 'scale(0.92)',
             opacity: barIntro ? 1 : 0,
+            visibility: barRebaseHidden ? 'hidden' : undefined,
+            pointerEvents: barRebaseHidden ? 'none' : undefined,
           }}
           data-tauri-drag-region="false"
         >

@@ -302,6 +302,13 @@ export const api = {
     invoke<void>('lens_delete_history_image', { imageId }),
   lensSetFloating: (rect: { x?: number; y?: number; width: number; height: number }) =>
     invoke<void>('lens_set_floating', { rect }),
+  lensFlyFloating: (rect: {
+    from: { x: number; y: number }
+    to: { x: number; y: number }
+    width: number
+    height: number
+    durationMs?: number
+  }) => invoke<void>('lens_fly_floating', { rect }),
 
   // 取走 Rust 端在 lens_request_internal 中抓到的选中文本（take 一次清一次）
   takeLensSelection: () => invoke<string>('take_lens_selection'),

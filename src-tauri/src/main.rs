@@ -29,7 +29,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, RwLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arboard::Clipboard;
@@ -2090,6 +2090,105 @@ struct FloatingRect {
     height: f64,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FloatingPoint {
+    x: f64,
+    y: f64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FloatingFlyRect {
+    from: FloatingPoint,
+    to: FloatingPoint,
+    width: f64,
+    height: f64,
+    duration_ms: Option<u64>,
+}
+
+fn ease_out_cubic(t: f64) -> f64 {
+    let inv = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - inv * inv * inv
+}
+
+fn apply_floating_fly_rect(window: &WebviewWindow, rect: &FloatingFlyRect) -> Result<(), String> {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return Err("Invalid floating rect size".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use ::windows::Win32::Graphics::Dwm::DwmFlush;
+        use ::windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+        };
+
+        if let Ok(hwnd) = window.hwnd() {
+            let scale = window.scale_factor().unwrap_or(1.0);
+            let scale = if scale.is_finite() && scale > 0.0 {
+                scale
+            } else {
+                1.0
+            };
+            let width = (rect.width * scale).round().max(1.0) as i32;
+            let height = (rect.height * scale).round().max(1.0) as i32;
+            let from_x = (rect.from.x * scale).round() as i32;
+            let from_y = (rect.from.y * scale).round() as i32;
+            let to_x = (rect.to.x * scale).round() as i32;
+            let to_y = (rect.to.y * scale).round() as i32;
+            let flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER;
+
+            unsafe {
+                SetWindowPos(hwnd, None, from_x, from_y, width, height, flags)
+                    .map_err(|e| format!("SetWindowPos(lens fly start) failed: {e}"))?;
+            }
+
+            if from_x == to_x && from_y == to_y {
+                return Ok(());
+            }
+
+            let duration_ms = rect.duration_ms.unwrap_or(260).clamp(80, 600);
+            let duration = Duration::from_millis(duration_ms);
+            let started = Instant::now();
+            let mut last_x = from_x;
+            let mut last_y = from_y;
+
+            loop {
+                let linear =
+                    (started.elapsed().as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
+                let eased = ease_out_cubic(linear);
+                let next_x = (from_x as f64 + (to_x - from_x) as f64 * eased).round() as i32;
+                let next_y = (from_y as f64 + (to_y - from_y) as f64 * eased).round() as i32;
+
+                if next_x != last_x || next_y != last_y || linear >= 1.0 {
+                    unsafe {
+                        SetWindowPos(hwnd, None, next_x, next_y, 0, 0, flags | SWP_NOSIZE)
+                            .map_err(|e| format!("SetWindowPos(lens fly frame) failed: {e}"))?;
+                    }
+                    last_x = next_x;
+                    last_y = next_y;
+                }
+
+                if linear >= 1.0 {
+                    break;
+                }
+
+                let flushed = unsafe { DwmFlush().is_ok() };
+                if !flushed {
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+            }
+
+            return Ok(());
+        }
+    }
+
+    let _ = window.set_position(tauri::LogicalPosition::new(rect.to.x, rect.to.y));
+    let _ = window.set_size(tauri::LogicalSize::new(rect.width, rect.height));
+    Ok(())
+}
+
 #[tauri::command]
 fn lens_set_floating(app: AppHandle, rect: FloatingRect) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -2148,6 +2247,14 @@ fn lens_set_floating(app: AppHandle, rect: FloatingRect) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[tauri::command]
+fn lens_fly_floating(app: AppHandle, rect: FloatingFlyRect) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("lens") else {
+        return Ok(());
+    };
+    apply_floating_fly_rect(&window, &rect)
 }
 
 // ====== /Lens 模式命令 ======
@@ -3256,6 +3363,7 @@ fn main() {
             lens_cancel_stream,
             lens_close,
             lens_set_floating,
+            lens_fly_floating,
             take_lens_selection,
             lens_commit_image_to_history,
             lens_delete_history_image,
