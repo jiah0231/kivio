@@ -1183,13 +1183,16 @@ export default function Lens() {
               setFloatingRebased(true)
               setBarIntro(true)
               setBarNoTransition(true)
-              setFlyDelta({ x: 0, y: 0 })
+              setFlyDelta({
+                x: finalX - FLOATING_PADDING,
+                y: finalY - FLOATING_PADDING,
+              })
             })
             void api.lensSetFloating({ x: floatingOrigin.x, y: floatingOrigin.y, width: floatW, height: floatH })
               .then(() => {
                 if (motionSeq !== motionSeqRef.current || stageRef.current === 'select') return
-                requestAnimationFrame(() => {
-                  if (motionSeq === motionSeqRef.current) setBarNoTransition(false)
+                flushSync(() => {
+                  setFlyDelta({ x: 0, y: 0 })
                 })
               })
               .catch((err: unknown) => {
