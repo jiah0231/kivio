@@ -119,6 +119,8 @@ Lens has a `web_search_enabled` setting. It is only applied to Responses API req
 - **Windows**:
   - Region capture still uses `xcap` for the final crop, but Lens selection can freeze the screen with `native_freeze.rs`
   - `native_freeze.rs` uses Win32 GDI to capture the desktop into a native topmost overlay so large screenshots do not need to be pushed through WebView
+  - When Lens is configured not to stay fullscreen after capture, the prompt/result window uses native floating-window movement instead of CSS animation inside a fullscreen WebView
+  - `lens_fly_floating` animates the small Lens window with Win32 `SetWindowPos` and `DwmFlush`, avoiding the WebView2 blank/recomposition frame caused by resizing a fullscreen WebView after an in-page fly animation
   - The frontend Lens overlay remains responsible for selection UI and final question/answer flow
   - Auto-paste uses `enigo` to simulate `Ctrl+V`
 
@@ -144,6 +146,8 @@ Lens has a `web_search_enabled` setting. It is only applied to Responses API req
 9. Follow-up questions reuse the same `image_id` and recent messages
 10. History keeps the most recent 20 records, with thumbnails in `localStorage` and images in `lens-history`
 11. Supports pure-text questions without screenshot
+
+If `keepFullscreenAfterCapture` is false, preserve the current UI but keep the motion path native: first resize/reposition Lens to a small floating window at the current prompt position, hide the rebased in-page bar only during that transition frame, then call `lens_fly_floating` to move the native window to the target anchor. Do not reintroduce the old flow where the bar flies in fullscreen CSS and `lens_set_floating` shrinks the WebView afterwards; that path can flash on Windows because WebView2 recomposes its surface.
 
 ### Screenshot Translation Flow
 
