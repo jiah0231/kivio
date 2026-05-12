@@ -22,6 +22,7 @@ function Translator({
 }) {
   const [input, setInput] = useState('')
   const [result, setResult] = useState('')
+  const [resultInput, setResultInput] = useState('')
   const [loading, setLoading] = useState(false)
   const resultRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -31,9 +32,10 @@ function Translator({
   // 输入防抖翻译：600ms 延迟后发送翻译请求
   useEffect(() => {
     const seq = ++translateSeq.current
+    setResult('')
+    setResultInput('')
     const trimmed = input.trim()
     if (!trimmed) {
-      setResult('')
       setLoading(false)
       return
     }
@@ -45,10 +47,12 @@ function Translator({
         const translated = await api.translateText(input)
         if (seq !== translateSeq.current) return
         setResult(translated)
+        setResultInput(input)
       } catch (e) {
         if (seq !== translateSeq.current) return
         console.error(e)
         setResult(typeof e === 'string' ? e : (e as Error).message || 'Error')
+        setResultInput(input)
       } finally {
         if (seq === translateSeq.current) setLoading(false)
       }
@@ -85,27 +89,49 @@ function Translator({
     }
   }, [input])
 
+  // 热键打开翻译器时，后端会先抓取当前选中文本；这里消费后填入输入框并触发现有自动翻译。
+  useEffect(() => {
+    let cleanup: (() => void) | undefined
+    const applySelection = async () => {
+      try {
+        const text = await api.takeTranslatorSelection()
+        if (!text.trim()) return
+        setInput(text)
+        setResult('')
+        window.setTimeout(() => inputRef.current?.focus(), 0)
+      } catch (err) {
+        console.warn('[Translator] Failed to take selected text:', err)
+      }
+    }
+    api.onTranslatorPrefill(() => {
+      void applySelection()
+    }).then((unlisten) => {
+      cleanup = unlisten
+    })
+    void applySelection()
+    return () => {
+      cleanup?.()
+    }
+  }, [])
+
   // Enter 键提交翻译结果
   // IME 合成中（中/日/韩输入法选词按回车）不要触发：isComposing 是组合事件官方标志，
   // keyCode === 229 是浏览器在 IME 拦截 keydown 时的兜底信号，两个条件并查更稳。
   const handleKeyDown = async (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key !== 'Enter') return
     if (e.nativeEvent.isComposing || e.keyCode === 229) return
-    const textToCommit = result || input
+    if (loading || !result || resultInput !== input) return
+    const textToCommit = result
     await api.commitTranslation(textToCommit)
     setInput('')
     setResult('')
+    setResultInput('')
   }
 
   return (
     <div className="window-container">
       {/* 卡片：填满外壳 padding 内区域；圆角 + 阴影都在这层 */}
       <div className="window-frosted h-full w-full flex flex-col select-none overflow-hidden relative group">
-        {/* 顶部隐形 drag bar */}
-        <div
-          className="absolute top-0 left-0 right-0 h-6 z-10"
-          data-tauri-drag-region
-        />
 
         {/* 设置按钮（悬浮右上角） */}
         <button
@@ -153,7 +179,10 @@ function Translator({
         />
 
         {/* 底部提示 */}
-        <div className="mt-1.5 flex justify-between items-center text-[10px] text-neutral-400 dark:text-neutral-500">
+        <div
+          className="mt-1.5 flex justify-between items-center text-[10px] text-neutral-400 dark:text-neutral-500"
+          data-tauri-drag-region
+        >
           <div className="flex items-center gap-2">
             <span>{t.translatorHintEnter}</span>
             <span>{t.translatorHintEsc}</span>

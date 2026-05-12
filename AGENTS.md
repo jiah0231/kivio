@@ -250,3 +250,111 @@ These files satisfy Tauri `externalBin` validation on Windows. They are local bu
 - Git history follows Conventional Commits (`feat:`, `fix:`, `refactor:`, `chore:`)
 - Use short, imperative subjects
 - PRs should include a concise summary, testing notes, and screenshots/GIFs for UI changes
+
+## Current Work Handoff
+
+This section captures the latest local work so a new Codex context can continue without rediscovering the same details.
+
+### Recent changes in this session (2026-05-10/11)
+
+**Upstream v2.6.0 migration completed** — backend split into focused modules (`commands.rs`, `shortcuts.rs`, `lens_commands.rs`, `updates.rs`, `browser_automation.rs`). `main.rs` is now a slim entry point.
+
+**Reasoning effort (GPT o-series thinking summary)**:
+- `ModelProvider` gained `reasoning_effort: Option<String>` (low/medium/high/xhigh).
+- `apply_responses_reasoning` injects `{ "effort": "<value>", "summary": "auto" }` for Responses API when set.
+- Settings UI shows effort selector in provider card when endpoint is Responses API.
+
+**Tavily web search integration** (client-side tool calling):
+- `Settings.tavily_api_key` — global Tavily API key field.
+- When key is set, `call_vision_api` injects a `tavily_web_search` function tool into all endpoint formats (Chat Completions / Messages / Responses).
+- First request is non-streaming to detect if model calls the tool. If yes: call Tavily, inject results, send second streaming request. If no: emit the non-streaming result directly.
+- `extract_tavily_tool_call_query` handles all three response formats.
+- Frontend shows "Searched web: {query}" indicator with hover tooltip listing results.
+- Tool name is `tavily_web_search` (not `web_search`) to avoid proxy interception.
+
+**Authentication fix for Claude Messages endpoint**:
+- `claude_auth_headers` changed from `x-api-key` to `Bearer` auth — third-party proxies (Sub2API, XTOKEN) only accept Bearer tokens.
+- `anthropic-version: 2023-06-01` header retained.
+
+**Connection test / model fetch fix**:
+- `test_provider_connection` and `fetch_models` now use `models_url_from_provider_url` to correctly strip endpoint suffixes before appending `/models`.
+- Claude Messages endpoints use Bearer + `anthropic-version` header for model listing.
+
+**HTTP client timeout fix**:
+- Removed global 60s `timeout` that killed SSE streams mid-response.
+- Now uses `connect_timeout: 30s` + `read_timeout: 300s`.
+
+**Lens model name display restored**:
+- `formatLensAsking` + `activeLensModel` state restored from pre-migration code.
+- Shows current model name in "正在回答..." indicator.
+
+**Lens streaming / Tavily / Responses fixes after packaging tests**:
+- Ordinary Lens questions now stream again when a Tavily API key is configured. Tavily probing only runs when `query_likely_needs_web_search(...)` detects an explicit search or time-sensitive query.
+- Tavily Responses second-turn requests no longer send `previous_response_id`, because some OpenAI-compatible proxies reject it with `previous_response_id is only supported on Responses WebSocket v2`.
+- Tavily Responses second-turn replay now copies only the `function_call` item from the first response, not reasoning/message output. This prevents first-turn reasoning summaries from being fed back into the second turn.
+- Responses final text parsing now only appends true suffixes from `*.done` events, so completed text is not appended twice.
+- Responses SSE parsing now classifies `response.reasoning_summary_text.*`, `summary_text`, and reasoning `content_part.done` events as reasoning, not answer text. This fixes the bug where the thinking summary appeared both in the ThinkingBlock and in the normal answer body.
+
+**Windows Lens floating / drag path restored**:
+- `lens_set_floating` clears the interactive region and resizes/repositions the native window instead of relying on clipped fullscreen behavior.
+- `Lens.tsx` uses native small-window rebasing on Windows floating mode and an explicit drag handle via `api.startDragging()`.
+
+### API compatibility expectations
+
+Keep all provider endpoint suffixes compatible:
+- base OpenAI-compatible URL such as `https://example.com/v1`
+- direct `/chat/completions`
+- direct `/responses`
+- direct Anthropic-style `/messages`
+
+All three endpoint types support Tavily tool calling when `tavily_api_key` is set. The tool is injected as:
+- Chat Completions: OpenAI function tool format
+- Messages: Claude `input_schema` tool format
+- Responses: Responses API function tool format
+
+Native web search (`web_search_20250305` for Claude, `web_search` for Responses API) has been removed in favor of Tavily. This avoids proxy compatibility issues.
+
+### Important files for continuation
+
+- `src-tauri/src/api.rs` - provider routing, Tavily integration, tool call detection, SSE parsing, retries/failover.
+- `src-tauri/src/commands.rs` - settings load/save, connection test, model fetch, translation commands.
+- `src-tauri/src/settings.rs` - Settings schema including `tavily_api_key`, `ModelProvider.reasoning_effort`, `ModelProvider.web_search_enabled`.
+- `src-tauri/src/main.rs` - slim app entry, plugin registration, command registration.
+- `src-tauri/src/shortcuts.rs` - global hotkeys, tray, selected-text capture.
+- `src-tauri/src/lens_commands.rs` - Lens command surface.
+- `src/Lens.tsx` - Lens UI, search indicator, answer streaming, reasoning display.
+- `src/App.tsx` - main translator UI.
+- `src/api/tauri.ts` - frontend Tauri invoke/event API contract (includes `searchQuery`/`searchResults` in `LensStreamPayload`).
+- `src/Settings.tsx` - provider settings UI, Tavily API key input, reasoning effort selector.
+
+### Validation already run recently
+
+- `npm run typecheck` ✓
+- `npm run lint` ✓
+- `cargo check --manifest-path src-tauri/Cargo.toml` ✓
+- `cargo test --manifest-path src-tauri/Cargo.toml` ✓ (latest run: 56 tests passed)
+- `npx tauri build --bundles nsis` ✓
+- `npm run build` builds the release exe but currently fails during MSI bundling at WiX `light` with `拒绝访问。 (os error 5)`
+
+Current Windows bundle outputs (v2.6.0):
+- `D:\Desktop\kivio\src-tauri\target\release\bundle\nsis\Kivio_2.6.0_x64-setup.exe`
+- `D:\Desktop\kivio\src-tauri\target\release\kivio.exe`
+
+MSI note:
+- `D:\Desktop\kivio\src-tauri\target\release\bundle\msi\Kivio_2.6.0_x64_en-US.msi` may exist, but it is an older artifact unless the WiX permission issue is fixed.
+
+### Known issues / follow-up
+
+- Tavily web-search queries still use a non-streaming first probe to detect tool calls. Non-search Lens questions should bypass the probe and stream normally.
+- `ModelProvider.web_search_enabled` field still exists in settings schema but is no longer used by the UI or backend logic (Tavily activates automatically when key is present). Can be removed in a cleanup pass.
+- Lens `webSearchEnabled` setting in `LensConfig` is also unused now. Same cleanup opportunity.
+- Full `npm run build` still needs MSI/WiX `os error 5` diagnosis if MSI output is required. NSIS packaging succeeds.
+- Some Rust warnings remain (unused imports/variables, unused browser_automation helpers). Non-blocking.
+
+### Gotchas
+
+- Third-party proxies (Sub2API, XTOKEN) do NOT support Claude native server tools (`web_search_20250305`). They filter out the `tools` field or return errors. Always use `tavily_web_search` function tool instead.
+- These proxies only accept Bearer auth, not `x-api-key`. The `claude_auth_headers` function uses `.bearer_auth(key)`.
+- Tool name must not be `web_search` — some proxies intercept that name and try to handle it themselves, causing "无法从消息中提取搜索查询" errors.
+- Responses stream events with `reasoning`, `reasoning_summary_text`, or `summary_text` must never be treated as normal answer deltas. Keep `response_stream_is_reasoning_event(...)` and `response_stream_message_item_text(...)` strict.
+- Probe/non-streaming approach avoids the complexity of detecting tool calls mid-stream. Keep it limited to likely web-search queries so ordinary Lens answers remain streaming.

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   X, Save, Plus, Trash2, RefreshCw,
   Settings as SettingsIcon, Languages, Camera,
@@ -9,7 +9,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import ReactMarkdown from 'react-markdown'
 import { api, type Settings as SettingsType, type ModelProvider, type DefaultPromptTemplates, type PermissionStatus, type UpdateInfo } from './api/tauri'
 import { i18n } from './settings/i18n'
-import { buildHotkey, getPlatform } from './settings/utils'
+import { buildHotkey, formatHotkeyError, getPlatform, stableStringify } from './settings/utils'
 import { PROVIDER_PRESETS, type ProviderPreset } from './settings/providerPresets'
 import { ModelPairSelect } from './settings/ModelPairSelect'
 import { ScreenshotTranslationSettings } from './settings/ScreenshotTranslationSettings'
@@ -20,6 +20,38 @@ import {
 } from './settings/components'
 
 type SettingsData = SettingsType
+type ProviderEndpointMode = 'base' | 'chat' | 'responses' | 'messages'
+
+const endpointSuffixes: Record<Exclude<ProviderEndpointMode, 'base'>, string> = {
+  chat: '/chat/completions',
+  responses: '/responses',
+  messages: '/messages',
+}
+
+function trimEndpointSuffix(url: string) {
+  const trimmed = url.trim().replace(/\/+$/, '')
+  const lower = trimmed.toLowerCase()
+  for (const suffix of Object.values(endpointSuffixes)) {
+    if (lower.endsWith(suffix)) {
+      return trimmed.slice(0, trimmed.length - suffix.length)
+    }
+  }
+  return trimmed
+}
+
+function endpointModeFromUrl(url: string): ProviderEndpointMode {
+  const lower = url.trim().replace(/\/+$/, '').toLowerCase()
+  if (lower.endsWith(endpointSuffixes.responses)) return 'responses'
+  if (lower.endsWith(endpointSuffixes.messages)) return 'messages'
+  if (lower.endsWith(endpointSuffixes.chat)) return 'chat'
+  return 'base'
+}
+
+function applyEndpointMode(url: string, mode: ProviderEndpointMode) {
+  const base = trimEndpointSuffix(url)
+  if (mode === 'base') return base
+  return `${base}${endpointSuffixes[mode]}`
+}
 
 interface SettingsProps {
   onClose: () => void
@@ -40,6 +72,7 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
   const [saveError, setSaveError] = useState('')
   const [saveSuccess, setSaveSuccess] = useState(false)
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false)
+  const [confirmDeleteProviderId, setConfirmDeleteProviderId] = useState<string | null>(null)
   const [recordingTarget, setRecordingTarget] = useState<null | 'main' | 'screenshotTranslation' | 'screenshotTranslationText' | 'lens'>(null)
   const [defaultPrompts, setDefaultPrompts] = useState<DefaultPromptTemplates | null>(null)
   const [retryAttemptsInput, setRetryAttemptsInput] = useState('')
@@ -74,7 +107,59 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
   const lang = settings?.settingsLanguage || 'zh'
   const t = i18n[lang]
   // 判断是否有未保存的更改
-  const hasUnsavedChanges = settings ? JSON.stringify(settings) !== initialSettingsSnapshot : false
+  const hasUnsavedChanges = settings ? stableStringify(settings) !== initialSettingsSnapshot : false
+
+  // 客户端热键冲突检测:在保存前发现"两个启用功能用了同一个组合"。
+  // OS 层面的冲突(Spotlight 占用 Cmd+Space 等)仍需保存后从后端拿到结果。
+  // 返回每个 scope 对应的"和谁冲突"——前端各 HotkeyInput 拿到对应 scope 的伙伴名后,
+  // 用 hotkeyScope* 模板自己拼本地化字符串。
+  type HotkeyScopeKey = 'main' | 'screenshotTranslation' | 'screenshotTranslationText' | 'lens'
+  const hotkeyConflicts = useMemo<Partial<Record<HotkeyScopeKey, HotkeyScopeKey>>>(() => {
+    if (!settings) return {}
+    const slots: Array<{ scope: HotkeyScopeKey; hotkey: string; enabled: boolean }> = [
+      { scope: 'main', hotkey: settings.hotkey || '', enabled: !!(settings.hotkey || '').trim() },
+      {
+        scope: 'screenshotTranslation',
+        hotkey: settings.screenshotTranslation?.hotkey || '',
+        enabled: settings.screenshotTranslation?.enabled !== false,
+      },
+      {
+        scope: 'screenshotTranslationText',
+        hotkey: settings.screenshotTranslation?.textHotkey || '',
+        enabled: settings.screenshotTranslation?.enabled !== false,
+      },
+      { scope: 'lens', hotkey: settings.lens?.hotkey || '', enabled: settings.lens?.enabled !== false },
+    ]
+    const groups = new Map<string, HotkeyScopeKey[]>()
+    for (const s of slots) {
+      const key = s.hotkey.trim().toLowerCase()
+      if (!key || !s.enabled) continue
+      const list = groups.get(key) ?? []
+      list.push(s.scope)
+      groups.set(key, list)
+    }
+    const out: Partial<Record<HotkeyScopeKey, HotkeyScopeKey>> = {}
+    for (const list of groups.values()) {
+      if (list.length < 2) continue
+      for (const scope of list) {
+        const partner = list.find(other => other !== scope)
+        if (partner) out[scope] = partner
+      }
+    }
+    return out
+  }, [settings])
+
+  const SCOPE_I18N_KEY: Record<HotkeyScopeKey, 'hotkeyScopeTranslator' | 'hotkeyScopeScreenshot' | 'hotkeyScopeScreenshotText' | 'hotkeyScopeLens'> = {
+    main: 'hotkeyScopeTranslator',
+    screenshotTranslation: 'hotkeyScopeScreenshot',
+    screenshotTranslationText: 'hotkeyScopeScreenshotText',
+    lens: 'hotkeyScopeLens',
+  }
+  const conflictMessageFor = (scope: HotkeyScopeKey): string | undefined => {
+    const partner = hotkeyConflicts[scope]
+    if (!partner) return undefined
+    return t.hotkeyConflictWith.replace('{partner}', t[SCOPE_I18N_KEY[partner]])
+  }
 
   // 初始化：加载设置、版本号、默认提示词
   // 重试通过递增 reloadKey 触发本 effect 重跑
@@ -86,7 +171,7 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
       .then((data: SettingsData) => {
         if (!active) return
         setSettings(data)
-        setInitialSettingsSnapshot(JSON.stringify(data))
+        setInitialSettingsSnapshot(stableStringify(data))
         setLoading(false)
       })
       .catch((err) => {
@@ -296,8 +381,9 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
         clearTimeout(saveSuccessTimerRef.current)
         saveSuccessTimerRef.current = null
       }
-      await api.saveSettings(settings)
-      setInitialSettingsSnapshot(JSON.stringify(settings))
+      const savedSettings = await api.saveSettings(settings)
+      setSettings(savedSettings)
+      setInitialSettingsSnapshot(stableStringify(savedSettings))
       onSettingsChange()
       setSaveSuccess(true)
       saveSuccessTimerRef.current = setTimeout(() => {
@@ -308,8 +394,9 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
     } catch (err) {
       console.error('Failed to save settings:', err)
       const message = err instanceof Error ? err.message : String(err)
-      const prefix = lang === 'zh' ? '保存失败：' : 'Save failed: '
-      setSaveError(`${prefix}${message.replace(/\n/g, ' / ')}`)
+      const translated = formatHotkeyError(message, lang)
+      const prefix = lang === 'zh' ? '保存失败:' : 'Save failed: '
+      setSaveError(`${prefix}${translated.replace(/\n/g, ' / ')}`)
       setSaveSuccess(false)
       return false
     } finally {
@@ -942,6 +1029,27 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
               </div>
             </section>
 
+            {/* Tavily Search API */}
+            <section>
+              <SectionTitle icon={Cloud}>{lang === 'zh' ? '联网搜索 (Tavily)' : 'Web Search (Tavily)'}</SectionTitle>
+              <div className="settings-card divide-y divide-black/[0.04] dark:divide-white/[0.05]">
+                <SettingRow
+                  label={lang === 'zh' ? 'Tavily API Key' : 'Tavily API Key'}
+                  description={lang === 'zh'
+                    ? '填写后，模型需要搜索时会自动调用 Tavily 联网搜索。获取 key: tavily.com'
+                    : 'When set, the model will automatically use Tavily to search the web when needed. Get a key at tavily.com'}
+                >
+                  <Input
+                    type="password"
+                    value={settings.tavilyApiKey || ''}
+                    onChange={(v) => updateSettings({ tavilyApiKey: v })}
+                    placeholder="tvly-..."
+                    mono
+                  />
+                </SettingRow>
+              </div>
+            </section>
+
             {/* 权限状态（仅 macOS 显示） */}
             {permissionStatus?.platform === 'macos' && (
               <section>
@@ -999,6 +1107,9 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
                   recordLabel={t.hotkeyRecord}
                   recordingLabel={t.hotkeyRecording}
                   recordingPlaceholder={t.hotkeyRecordingPlaceholder}
+                  onClear={() => updateSettings({ hotkey: '' })}
+                  clearLabel={t.hotkeyClear}
+                  error={conflictMessageFor('main')}
                 />
               </div>
             </section>
@@ -1081,6 +1192,9 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
               onToggleRecording={toggleRecording}
               onRefreshRapidOcrStatus={refreshRapidOcrStatus}
               onDownloadRapidOcr={handleDownloadRapidOcr}
+              hotkeyError={conflictMessageFor('screenshotTranslation')}
+              textHotkeyError={conflictMessageFor('screenshotTranslationText')}
+              hotkeyClearLabel={t.hotkeyClear}
             />
 
           </div>
@@ -1112,6 +1226,9 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
                           recordLabel={t.hotkeyRecord}
                           recordingLabel={t.hotkeyRecording}
                           recordingPlaceholder={t.hotkeyRecordingPlaceholder}
+                          onClear={() => updateLens({ hotkey: '' })}
+                          clearLabel={t.hotkeyClear}
+                          error={conflictMessageFor('lens')}
                         />
                       </div>
                       <SettingRow label={t.lensResponseLanguage}>
@@ -1137,12 +1254,6 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
                         <Toggle
                           checked={settings.lens?.thinkingEnabled !== false}
                           onChange={(v) => updateLens({ thinkingEnabled: v })}
-                        />
-                      </SettingRow>
-                      <SettingRow label={t.lensWebSearchEnabled} description={t.lensWebSearchHint}>
-                        <Toggle
-                          checked={settings.lens?.webSearchEnabled === true}
-                          onChange={(v) => updateLens({ webSearchEnabled: v })}
                         />
                       </SettingRow>
                       <SettingRow label={t.lensMessageOrder}>
@@ -1250,7 +1361,7 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
                       </span>
                     )}
                     <button
-                      onClick={() => deleteProvider(provider.id)}
+                      onClick={() => setConfirmDeleteProviderId(provider.id)}
                       className="shrink-0 p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-500/10 rounded-md transition-colors"
                       title={t.deleteProvider}
                       data-tauri-drag-region="false"
@@ -1272,6 +1383,67 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
                           mono
                         />
                       </div>
+                      <div className="mt-2 grid grid-cols-[120px_minmax(0,1fr)] items-center gap-2">
+                        <span className="text-[11px] font-medium text-neutral-500 dark:text-neutral-400">
+                          {lang === 'zh' ? '接口类型' : 'Endpoint'}
+                        </span>
+                        <Select
+                          value={endpointModeFromUrl(provider.baseUrl)}
+                          onChange={(mode) => updateProvider(provider.id, {
+                            baseUrl: applyEndpointMode(provider.baseUrl, mode as ProviderEndpointMode),
+                          })}
+                          options={[
+                            {
+                              value: 'base',
+                              label: lang === 'zh' ? '基础地址 (/v1)' : 'Base URL (/v1)',
+                            },
+                            {
+                              value: 'chat',
+                              label: 'Chat Completions',
+                            },
+                            {
+                              value: 'responses',
+                              label: 'Responses API',
+                            },
+                            {
+                              value: 'messages',
+                              label: 'Claude Messages',
+                            },
+                          ]}
+                        />
+                      </div>
+                      <p className="mt-1.5 text-[10.5px] leading-snug text-neutral-400 dark:text-neutral-500">
+                        {lang === 'zh'
+                          ? '浏览器工具和联网搜索需要选择 Responses API；Claude 原生接口请选择 Claude Messages。'
+                          : 'Browser tools and web search require Responses API; choose Claude Messages for Anthropic native API.'}
+                      </p>
+                    </div>
+                    )}
+
+                    {/* Reasoning Effort — 仅 Responses API 端点显示 */}
+                    {!isOnDevice && endpointModeFromUrl(provider.baseUrl) === 'responses' && (
+                    <div className="px-4 py-3">
+                      <div className="grid grid-cols-[120px_minmax(0,1fr)] items-center gap-2">
+                        <span className="text-[11px] font-medium text-neutral-500 dark:text-neutral-400">
+                          {lang === 'zh' ? '思考强度' : 'Reasoning Effort'}
+                        </span>
+                        <Select
+                          value={provider.reasoningEffort || ''}
+                          onChange={(v) => updateProvider(provider.id, { reasoningEffort: v || undefined })}
+                          options={[
+                            { value: '', label: lang === 'zh' ? '默认（不设置）' : 'Default (none)' },
+                            { value: 'low', label: 'Low' },
+                            { value: 'medium', label: 'Medium' },
+                            { value: 'high', label: 'High' },
+                            { value: 'xhigh', label: 'XHigh' },
+                          ]}
+                        />
+                      </div>
+                      <p className="mt-1.5 text-[10.5px] leading-snug text-neutral-400 dark:text-neutral-500">
+                        {lang === 'zh'
+                          ? '设置后 GPT o-series 模型会返回思考摘要（reasoning summary）。不设置则由模型自行决定。'
+                          : 'When set, GPT o-series models return a reasoning summary. Leave as default to let the model decide.'}
+                      </p>
                     </div>
                     )}
 
@@ -1750,6 +1922,36 @@ export default function Settings({ onClose, onSettingsChange }: SettingsProps) {
                 className="px-3 py-1.5 text-[12px] rounded-md bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 {saving ? t.saving : t.saveAndClose}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* 删除提供商确认弹窗 */}
+      {confirmDeleteProviderId && (
+        <div className="absolute inset-0 z-50 bg-black/30 backdrop-blur-[1px] flex items-center justify-center p-4" data-tauri-drag-region="false">
+          <div className="w-full max-w-[340px] rounded-xl border border-black/10 dark:border-white/10 bg-white dark:bg-neutral-900 shadow-lg p-4 space-y-3">
+            <h3 className="text-[14px] font-semibold text-neutral-900 dark:text-neutral-100">{t.confirmDeleteProvider}</h3>
+            <p className="text-[12px] text-neutral-600 dark:text-neutral-300 leading-relaxed">{t.confirmDeleteProviderDesc}</p>
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteProviderId(null)}
+                className="px-3 py-1.5 text-[12px] rounded-md text-neutral-600 dark:text-neutral-300 hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+                data-tauri-drag-region="false"
+              >
+                {t.cancel}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (confirmDeleteProviderId) deleteProvider(confirmDeleteProviderId)
+                  setConfirmDeleteProviderId(null)
+                }}
+                className="px-3 py-1.5 text-[12px] rounded-md bg-red-600 hover:bg-red-700 text-white transition-colors"
+                data-tauri-drag-region="false"
+              >
+                {t.deleteProvider}
               </button>
             </div>
           </div>

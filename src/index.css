@@ -196,3 +196,51 @@ body {
 .animate-lens-frame-fade {
   animation: lens-frame-fade 220ms ease-out both;
 }
+
+/* Lens answers live in a compact floating panel; Tailwind Typography's default
+   document-style spacing makes short paragraphs and code blocks feel detached. */
+.lens-markdown.prose :where(p):not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+  margin-top: 0.35rem;
+  margin-bottom: 0.35rem;
+}
+
+.lens-markdown.prose :where(h1, h2, h3, h4):not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+  margin-top: 0.85rem;
+  margin-bottom: 0.35rem;
+  line-height: 1.35;
+}
+
+.lens-markdown.prose :where(h5, h6):not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+  margin-top: 0.65rem;
+  margin-bottom: 0.25rem;
+  line-height: 1.35;
+}
+
+.lens-markdown.prose :where(ul, ol):not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+  margin-top: 0.35rem;
+  margin-bottom: 0.45rem;
+  padding-inline-start: 1.35em;
+}
+
+.lens-markdown.prose :where(li):not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+  margin-top: 0.15rem;
+  margin-bottom: 0.15rem;
+}
+
+.lens-markdown.prose :where(pre, blockquote, table):not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+  margin-top: 0.55rem;
+  margin-bottom: 0.65rem;
+}
+
+.lens-markdown.prose :where(hr):not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+  margin-top: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.lens-markdown.prose > :first-child:not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+  margin-top: 0;
+}
+
+.lens-markdown.prose > :last-child:not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+  margin-bottom: 0;
+}

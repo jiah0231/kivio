@@ -91,15 +91,23 @@ A single busy flag (`AppState.lens_busy`, `AtomicBool`) prevents concurrent over
 
 ### Rust Backend Structure
 
-- **`main.rs`** — Tauri commands, update flow, hotkey registration, tray setup, window lifecycle, capture orchestration, and app startup.
-- **`api.rs`** — HTTP client setup, provider credential resolution, retry/failover, OpenAI-compatible text/OCR/vision calls, and SSE stream parsing.
-- **`state.rs`** — `AppState`, lock helpers, Lens runtime state, and multi-key cooldown / active-key selection.
-- **`settings.rs`** — Settings schema, serde defaults, `sanitize_settings` migration/validation, one-shot `migrate_legacy_keyring_keys` (gated by `legacy_keyring_migrated` flag), `persist_settings` (mirrors `apiKeys[0]` to legacy `apiKey` field for downgrade compat).
-- **`screenshot.rs`** — Temp PNG cleanup helpers (`cleanup_temp_file` for one-shot, `cleanup_orphan_temp_files` for app-startup GC of stale `lens-*.png` / `screenshot-*.png` older than 24 h).
-- **`sck.rs`** — macOS-only ScreenCaptureKit wrapper invoked by `lens_capture_window` / `lens_capture_region`.
-- **`lens.rs`** — Lens overlay state machine support: `lens_list_windows` (macOS only; Windows returns `[]`), capture coord helpers.
-- **`windows.rs`** — Window helpers: `ensure_main_window`, `ensure_lens_window`, `get_main_window`, plus `apply_macos_workspace_behavior` for `visibleOnAllWorkspaces`.
-- **`utils.rs`** — Language detection, target language resolution, timestamp helper.
+The backend has been migrated to the upstream v2.6.0 split-module layout. Keep new work in the focused module instead of putting large command bodies back into `main.rs`.
+
+- **`main.rs`** - Tauri builder setup, plugin registration, app state initialization, startup update check, and `generate_handler!` command registration only.
+- **`commands.rs`** - general app commands: settings load/save, text translation, commit/paste, provider/model fetching, permission checks, RapidOCR status/install, Apple Intelligence availability, and selection handoff commands.
+- **`shortcuts.rs`** - global hotkey registration, tray setup, hotkey error serialization/localization, selected-text capture, main/settings window activation, and runtime hotkey rollback helpers.
+- **`lens_commands.rs`** - Lens command surface: request/select flow, screenshot capture, Lens chat/translation commands, floating-window sizing/animation commands, history image persistence, and image path resolution.
+- **`updates.rs`** - GitHub release check, update asset download, progress events, and installer launch/quit flow.
+- **`api.rs`** - HTTP client setup, provider credential resolution, retry/failover, OpenAI-compatible text/OCR/vision calls, `/chat/completions`/`/responses`/`/messages` routing, and SSE stream parsing.
+- **`browser_automation.rs`** - local browser bridge commands and generated Chrome extension support used by browser automation.
+- **`state.rs`** - `AppState`, lock helpers, Lens runtime state, pending selection state, and multi-key cooldown / active-key selection.
+- **`settings.rs`** - Settings schema, serde defaults, `sanitize_settings` migration/validation, one-shot `migrate_legacy_keyring_keys`, and prompt defaults.
+- **`screenshot.rs`** - Temp PNG cleanup helpers (`cleanup_temp_file` for one-shot, `cleanup_orphan_temp_files` for app-startup GC of stale `lens-*.png` / `screenshot-*.png` older than 24 h).
+- **`sck.rs`** - macOS-only ScreenCaptureKit wrapper invoked by Lens capture commands.
+- **`lens.rs`** - Lens window enumeration and platform capture helpers.
+- **`native_freeze.rs`** - Windows native frozen-screen overlay support retained from local work.
+- **`windows.rs`** - Window helpers: `ensure_main_window`, `ensure_lens_window`, `get_main_window`, plus `apply_macos_workspace_behavior` for `visibleOnAllWorkspaces`.
+- **`utils.rs`** - Language detection, target language resolution, timestamp helper.
 
 Key crate responsibilities from `Cargo.toml`:
 - `enigo` — simulates keyboard paste after translation commit.
@@ -140,3 +148,54 @@ Manual releases are also supported via `workflow_dispatch`.
 - **Windows**: Manual launch opens settings by default. Autostart uses a dedicated `--from-autostart` arg to avoid popping up settings. Single-instance guard ensures clicking the app icon focuses the existing instance.
 - **LaTeX math**: Both screenshot result and explain use `react-markdown` + `remark-math` + `rehype-katex` for rendering LaTeX formulas.
 - **Prompt templates**: Default prompts and prompt composition live in Rust (`prompts.rs` plus defaults exposed through `get_default_prompt_templates`). Custom prompts support `{lang}` and `{text}` placeholders.
+
+## Current Work Handoff
+
+Current branch: `codex/upstream-2.6-migration`. The upstream `ZMGID/kivio` v2.6.0 refactor has been migrated into this worktree, and the resolved changes are staged. A safety stash remains available as `stash@{0}: codex-pre-upstream-2.6-migration`.
+
+### Completed in this migration
+
+- Merged the upstream v2.6.0 layout: `main.rs` is now a slim app entry, backend commands are split into `commands.rs`, `shortcuts.rs`, `lens_commands.rs`, and `updates.rs`.
+- Split Lens frontend helpers into `src/lens/ArrowSvg.tsx`, `annotation.ts`, `history.ts`, `layout.ts`, `markdown.ts`, `ThinkingBlock.tsx`, and `types.ts`.
+- Kept local provider compatibility work in `src-tauri/src/api.rs`: base URLs, direct `/chat/completions`, direct `/responses`, and direct Anthropic-style `/messages` provider endpoints should remain supported.
+- Replaced native web-search tools with Tavily function calling. When `settings.tavily_api_key` is configured, `call_vision_api` can inject a `tavily_web_search` tool for Chat Completions, Messages, and Responses endpoints.
+- Kept browser automation support via `src-tauri/src/browser_automation.rs`, Tauri command registration in `main.rs`, and frontend bridge methods in `src/api/tauri.ts`.
+- Kept main translator selected-text handoff: `shortcuts.rs` captures selection before showing the translator, `commands.rs` exposes `take_translator_selection`, and `App.tsx` consumes `api.takeTranslatorSelection()` to prefill and auto-translate.
+- Adopted upstream macOS Lens native floating animation via `lens_animate_floating` / `api.lensAnimateFloating`.
+- Kept Lens history sizing logic and reasoning display through the new `ThinkingBlock` component.
+- Restored normal streaming for ordinary Lens questions with a Tavily key present by only probing Tavily when `query_likely_needs_web_search(...)` detects an explicit or time-sensitive web query.
+- Fixed Windows Lens floating mode so `lens_set_floating` clears the interactive region and uses the native small-window path; `Lens.tsx` also has an explicit drag handle that calls `api.startDragging()`.
+- Fixed Responses + Tavily second-turn compatibility: do not send `previous_response_id`; replay only the original input, the first response `function_call`, and the `function_call_output`.
+- Fixed Responses reasoning leakage: `response.reasoning_summary_text.*`, `summary_text`, and reasoning `content_part.done` events are routed to reasoning or ignored, never appended to the normal answer body.
+
+### Validation and package output
+
+These commands passed recently:
+
+- `npm run typecheck`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `npm run lint`
+- `cargo test --manifest-path src-tauri/Cargo.toml` (latest run: 56 tests passed)
+- `npx tauri build --bundles nsis`
+
+Latest Windows NSIS package:
+
+- `D:\Desktop\kivio\src-tauri\target\release\bundle\nsis\Kivio_2.6.0_x64-setup.exe`
+
+Latest release executable:
+
+- `D:\Desktop\kivio\src-tauri\target\release\kivio.exe`
+
+Full `npm run build` currently builds the release exe but fails at the MSI WiX `light` step with `拒绝访问。 (os error 5)`. Any existing MSI under `src-tauri\target\release\bundle\msi\` may be stale until that permission/lock issue is fixed. Rust build currently has warnings only, mostly unused imports/variables and unused browser-tool helper functions. They do not block NSIS packaging.
+
+### Important follow-up notes
+
+- Do not move large command bodies back into `main.rs`; add new backend command logic to the focused module and only register it in `main.rs`.
+- Preserve `/responses`, `/messages`, and `/chat/completions` compatibility across text, screenshot translation, and Lens flows.
+- Keep Tavily tool name as `tavily_web_search`; some proxies intercept generic `web_search` and fail to extract the query.
+- Keep Tavily probing limited to likely search queries so non-search Lens answers continue streaming.
+- Do not reintroduce `previous_response_id` for Responses Tavily second turns unless the target server is known to support that continuation mode.
+- Keep Responses stream parsing strict: reasoning events must stay out of normal answer deltas.
+- Keep selectable text protected from window dragging in the main translator, Lens answer panels, and screenshot translation cards.
+- Be careful with `native_freeze.rs`: upstream deleted it, but the local Windows capture/floating work may still depend on that path.
+- The staged migration is intentionally not committed yet. Review staged changes before committing or dropping the safety stash.

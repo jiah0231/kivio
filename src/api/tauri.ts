@@ -10,7 +10,7 @@ import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window'
 
 // Lens 多轮对话消息类型（视觉模型）
 // reasoning：推理模型（DeepSeek-R1 等）的思维链文本，仅本地展示，不回传后端
-export type ExplainMessage = { role: 'user' | 'assistant'; content: string; reasoning?: string }
+export type ExplainMessage = { role: 'user' | 'assistant'; content: string; reasoning?: string; searchQuery?: string; searchResults?: string }
 
 // Lens 流式输出负载（事件名 lens-stream）
 // reasoningDelta：思维链增量（推理模型才会有）
@@ -19,6 +19,8 @@ export type LensStreamPayload = {
   kind: 'answer'
   delta: string
   reasoningDelta?: string
+  searchQuery?: string
+  searchResults?: string
   done?: boolean
   reason?: 'done' | 'cancelled' | 'error'
   full?: string
@@ -56,6 +58,8 @@ export type ModelProvider = {
   baseUrl: string
   availableModels: string[]
   enabledModels: string[]
+  reasoningEffort?: string
+  webSearchEnabled?: boolean
 }
 
 // 提供商连接测试输入（支持使用未保存的配置进行测试）
@@ -115,6 +119,7 @@ export type Settings = {
     streamEnabled?: boolean
     /** 思考模式开关（默认 true）。false 时 body 注入各厂商关闭思考的字段并集 */
     thinkingEnabled?: boolean
+    /** Responses API web search switch. Only applies when the provider URL points to /responses. */
     webSearchEnabled?: boolean
     systemPrompt?: string
     questionPrompt?: string
@@ -132,6 +137,8 @@ export type Settings = {
   imageArchiveEnabled?: boolean
   /** 自动归档目标目录路径 */
   imageArchivePath?: string
+  /** Tavily Search API key */
+  tavilyApiKey?: string
 }
 
 /** 更新检查结果（来自后端 GitHub Releases API 调用） */
@@ -161,6 +168,21 @@ export type RapidOcrInstallResult = {
   success: boolean
   /** 成功时是状态信息("RapidOCR 包下载完成"),失败时是错误片段 */
   message: string
+}
+
+export type BrowserAutomationInfo = {
+  host: string
+  port: number
+  extensionDir: string
+  sessionCount: number
+}
+
+export type BrowserTab = {
+  id: number
+  url: string
+  title: string
+  active: boolean
+  windowId?: number
 }
 
 // 默认提示词模板
@@ -202,7 +224,7 @@ export const api = {
   // 设置相关
   getSettings: () => invoke<Settings>('get_settings'),
   getDefaultPromptTemplates: () => invoke<DefaultPromptTemplates>('get_default_prompt_templates'),
-  saveSettings: (settings: Settings) => invoke<void>('save_settings', { settings }),
+  saveSettings: (settings: Settings) => invoke<Settings>('save_settings', { settings }),
 
   // 提供商相关
   fetchModels: (providerId: string, provider?: ProviderConnectionInput) =>
@@ -221,6 +243,7 @@ export const api = {
   // 文本翻译
   translateText: (text: string) => invoke<string>('translate_text', { text }),
   commitTranslation: (text: string) => invoke<void>('commit_translation', { text }),
+  takeTranslatorSelection: () => invoke<string>('take_translator_selection'),
 
   // 外部链接
   openExternal: (url: string) => invoke<void>('open_external', { url }),
@@ -253,6 +276,7 @@ export const api = {
 
   // 事件监听
   onOpenSettings: (listener: () => void) => on('open-settings', () => listener()),
+  onTranslatorPrefill: (listener: () => void) => on('translator-prefill', () => listener()),
 
   // 读取截图（lens ready 态拉缩略图用）
   explainReadImage: (imageId: string) =>
@@ -302,13 +326,10 @@ export const api = {
     invoke<void>('lens_delete_history_image', { imageId }),
   lensSetFloating: (rect: { x?: number; y?: number; width: number; height: number }) =>
     invoke<void>('lens_set_floating', { rect }),
-  lensFlyFloating: (rect: {
-    from: { x: number; y: number }
-    to: { x: number; y: number }
-    width: number
-    height: number
-    durationMs?: number
-  }) => invoke<void>('lens_fly_floating', { rect }),
+  // macOS 走 AppKit 原生 NSAnimationContext + animator setFrame,一次 IPC 触发,Core Animation
+  // 在合成器线程驱动剩余帧;duration_ms 必须与前端 TRANSITION_MS 对齐。非 macOS 平台是 snap 兜底。
+  lensAnimateFloating: (args: { x: number; y: number; width: number; height: number; durationMs: number }) =>
+    invoke<void>('lens_animate_floating', args),
 
   // 取走 Rust 端在 lens_request_internal 中抓到的选中文本（take 一次清一次）
   takeLensSelection: () => invoke<string>('take_lens_selection'),
@@ -347,4 +368,17 @@ export const api = {
   /** 下载 RapidOCR 包(onnxruntime dylib + 模型 + 字典)到 app data 目录。
    *  阻塞到全部完成返回(~15-30s,共 ~30-50MB),前端转圈圈等。 */
   rapidOcrInstall: () => invoke<RapidOcrInstallResult>('rapidocr_install'),
+
+  // ========== Browser automation bridge ==========
+
+  browserAutomationPrepare: () =>
+    invoke<BrowserAutomationInfo>('browser_automation_prepare'),
+  browserAutomationSessions: () =>
+    invoke<BrowserTab[]>('browser_automation_sessions'),
+  browserAutomationExecuteJs: (code: string, tabId?: number, timeoutMs?: number) =>
+    invoke<{ data: unknown; newTabs?: BrowserTab[] }>('browser_automation_execute_js', {
+      code,
+      tabId,
+      timeoutMs,
+    }),
 }

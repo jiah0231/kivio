@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
-import { Check, ChevronDown, ExternalLink, type LucideIcon } from 'lucide-react'
+import { Check, ChevronDown, ExternalLink, X, type LucideIcon } from 'lucide-react'
 import { formatHotkey, getPlatform } from './utils'
 
 function useSelectMenuRect(
@@ -9,18 +9,29 @@ function useSelectMenuRect(
   optionsLength: number,
   triggerRef: RefObject<HTMLButtonElement | null>,
 ) {
-  const [menuRect, setMenuRect] = useState({ left: 0, top: 0, width: 0 })
+  const [menuRect, setMenuRect] = useState({ left: 0, top: 0, width: 0, maxHeight: 260 })
 
   const updateMenuRect = useCallback(() => {
     const trigger = triggerRef.current
     if (!trigger) return
     const rect = trigger.getBoundingClientRect()
+    const viewportMargin = 10
+    const gap = 6
+    const estimatedOptionHeight = 34
+    const desiredHeight = Math.min(260, Math.max(40, optionsLength * estimatedOptionHeight + 8))
+    const spaceBelow = window.innerHeight - rect.bottom - gap - viewportMargin
+    const spaceAbove = rect.top - gap - viewportMargin
+    const placeAbove = spaceBelow < Math.min(desiredHeight, 160) && spaceAbove > spaceBelow
+    const maxHeight = Math.max(40, Math.min(desiredHeight, placeAbove ? spaceAbove : spaceBelow))
     setMenuRect({
       left: rect.left,
-      top: rect.bottom + 6,
+      top: placeAbove
+        ? Math.max(viewportMargin, rect.top - gap - maxHeight)
+        : Math.min(rect.bottom + gap, window.innerHeight - viewportMargin - maxHeight),
       width: rect.width,
+      maxHeight,
     })
-  }, [triggerRef])
+  }, [optionsLength, triggerRef])
 
   useLayoutEffect(() => {
     if (open) updateMenuRect()
@@ -130,8 +141,9 @@ export function Select({ value, onChange, options, className = '' }: {
         <div
           ref={menuRef}
           role="listbox"
-          className="fixed z-[1000] max-h-[260px] overflow-y-auto rounded-lg border border-black/10 dark:border-white/10 bg-white/95 dark:bg-neutral-900/95 shadow-[0_12px_36px_rgba(0,0,0,0.18)] backdrop-blur-xl custom-scrollbar p-1"
-          style={{ left: menuRect.left, top: menuRect.top, width: menuRect.width }}
+          className="fixed z-[1000] overflow-y-auto overscroll-contain rounded-lg border border-black/10 dark:border-white/10 bg-white/95 dark:bg-neutral-900/95 shadow-[0_12px_36px_rgba(0,0,0,0.18)] backdrop-blur-xl custom-scrollbar p-1"
+          style={{ left: menuRect.left, top: menuRect.top, width: menuRect.width, maxHeight: menuRect.maxHeight }}
+          onWheel={(event) => event.stopPropagation()}
           data-tauri-drag-region="false"
         >
           {options.map(opt => {
@@ -333,7 +345,9 @@ export function HotkeyDisplay({ hotkey }: { hotkey: string }) {
 }
 
 /**
- * 快捷键输入（含录制态）
+ * 快捷键输入(含录制态)
+ * onClear / clearLabel: 提供时,值非空且非录制态会渲染 X 按钮以清空(给"想关掉某个功能的热键"留出口);留空则不显示
+ * error: 客户端冲突等校验消息,以红色小字显示在输入框下方
  */
 export function HotkeyInput({
   value,
@@ -343,6 +357,9 @@ export function HotkeyInput({
   recordLabel,
   recordingLabel,
   recordingPlaceholder,
+  onClear,
+  clearLabel,
+  error,
 }: {
   value: string
   placeholder: string
@@ -351,36 +368,59 @@ export function HotkeyInput({
   recordLabel: string
   recordingLabel: string
   recordingPlaceholder: string
+  onClear?: () => void
+  clearLabel?: string
+  error?: string
 }) {
+  const showClear = !!onClear && !!value && !recording
   return (
-    <div className="flex items-center gap-2">
-      <div
-        className={`flex-1 flex items-center gap-1 min-h-[36px] px-2.5 rounded-md border transition-all ${
-          recording
-            ? 'border-amber-400/70 dark:border-amber-300/60 bg-amber-50/60 dark:bg-amber-900/15 ring-2 ring-amber-400/20 dark:ring-amber-300/20'
-            : 'border-black/[0.06] dark:border-white/[0.07] bg-black/[0.03] dark:bg-white/[0.04]'
-        }`}
-      >
-        {recording ? (
-          <span className="text-[12px] text-amber-600 dark:text-amber-300 animate-pulse">{recordingPlaceholder}</span>
-        ) : value ? (
-          <HotkeyDisplay hotkey={value} />
-        ) : (
-          <span className="text-[12px] text-neutral-400 dark:text-neutral-500">{placeholder}</span>
-        )}
+    <div className="space-y-1">
+      <div className="flex items-center gap-2">
+        <div
+          className={`flex-1 flex items-center gap-1 min-h-[36px] px-2.5 rounded-md border transition-all ${
+            recording
+              ? 'border-amber-400/70 dark:border-amber-300/60 bg-amber-50/60 dark:bg-amber-900/15 ring-2 ring-amber-400/20 dark:ring-amber-300/20'
+              : error
+                ? 'border-red-400/70 dark:border-red-400/60 bg-red-50/40 dark:bg-red-900/15'
+                : 'border-black/[0.06] dark:border-white/[0.07] bg-black/[0.03] dark:bg-white/[0.04]'
+          }`}
+        >
+          {recording ? (
+            <span className="text-[12px] text-amber-600 dark:text-amber-300 animate-pulse">{recordingPlaceholder}</span>
+          ) : value ? (
+            <HotkeyDisplay hotkey={value} />
+          ) : (
+            <span className="text-[12px] text-neutral-400 dark:text-neutral-500">{placeholder}</span>
+          )}
+          {showClear && (
+            <button
+              type="button"
+              onClick={onClear}
+              title={clearLabel}
+              aria-label={clearLabel}
+              className="ml-auto shrink-0 p-1 rounded text-neutral-400 hover:text-red-500 hover:bg-red-500/10 transition-colors"
+              data-tauri-drag-region="false"
+            >
+              <X size={12} strokeWidth={2.5} />
+            </button>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onToggleRecording}
+          className={`px-3 h-[36px] rounded-md text-[12px] font-medium border transition-all ${
+            recording
+              ? 'border-amber-400/70 text-amber-700 dark:text-amber-300 bg-amber-50/80 dark:bg-amber-900/25'
+              : 'border-black/10 dark:border-white/10 text-neutral-600 dark:text-neutral-300 hover:text-neutral-900 dark:hover:text-neutral-100 hover:bg-black/5 dark:hover:bg-white/5'
+          }`}
+          data-tauri-drag-region="false"
+        >
+          {recording ? recordingLabel : recordLabel}
+        </button>
       </div>
-      <button
-        type="button"
-        onClick={onToggleRecording}
-        className={`px-3 h-[36px] rounded-md text-[12px] font-medium border transition-all ${
-          recording
-            ? 'border-amber-400/70 text-amber-700 dark:text-amber-300 bg-amber-50/80 dark:bg-amber-900/25'
-            : 'border-black/10 dark:border-white/10 text-neutral-600 dark:text-neutral-300 hover:text-neutral-900 dark:hover:text-neutral-100 hover:bg-black/5 dark:hover:bg-white/5'
-        }`}
-        data-tauri-drag-region="false"
-      >
-        {recording ? recordingLabel : recordLabel}
-      </button>
+      {error && (
+        <p className="text-[11px] text-red-500 dark:text-red-400 leading-snug">{error}</p>
+      )}
     </div>
   )
 }

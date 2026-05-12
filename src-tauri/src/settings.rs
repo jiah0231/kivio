@@ -136,6 +136,10 @@ pub struct ModelProvider {
     pub available_models: Vec<String>,
     #[serde(default)]
     pub enabled_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_enabled: Option<bool>,
 }
 
 /**
@@ -366,6 +370,9 @@ pub struct Settings {
     /// 自动归档目标目录路径（空字符串表示未设置）
     #[serde(default)]
     pub image_archive_path: String,
+    /// Tavily Search API key（客户端侧联网搜索）
+    #[serde(default)]
+    pub tavily_api_key: String,
     // 旧版字段，用于迁移
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai: Option<OpenAIConfig>,
@@ -402,6 +409,7 @@ impl Default for Settings {
             auto_check_update: true,
             image_archive_enabled: false,
             image_archive_path: String::new(),
+            tavily_api_key: String::new(),
             openai: None,
         }
     }
@@ -436,6 +444,8 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
                 base_url: old_openai.base_url,
                 available_models: vec![],
                 enabled_models: vec![old_openai.model.clone()],
+                reasoning_effort: None,
+                web_search_enabled: None,
             });
             settings.translator_provider_id = "default-translator".to_string();
             settings.translator_model = old_openai.model;
@@ -456,6 +466,8 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
                 base_url: old_ocr.base_url,
                 available_models: vec![],
                 enabled_models: vec![old_ocr.model.clone()],
+                reasoning_effort: None,
+                web_search_enabled: None,
             });
             settings.screenshot_translation.provider_id = "default-ocr".to_string();
             settings.screenshot_translation.model = old_ocr.model;
@@ -785,28 +797,15 @@ pub fn load_settings(app: &AppHandle) -> Settings {
 /**
  * 获取默认系统提示词
  * has_image=true 时为视觉助手；为 false 时为通用对话助手（不假设有图片）
- * 风格统一：简短直答、无小标题、思考过程尽量精简
+ * 仅作为设置页占位展示；Lens 默认不会主动注入 system prompt。
  */
 pub fn default_system_prompt(language: &str, has_image: bool) -> String {
     match (language.starts_with("zh"), has_image) {
-    (true, true) => "你是一位智能助手，能够看到用户分享的截图。请将其作为视觉上下文来理解和回答，可以涉及信息提取、概念解释、操作协助或任何相关话题。保持回答简洁直接，自然流畅，不用小标题和编号。输出必须紧凑：不要输出空行；只有在真正需要分隔段落、列表项、表格行、代码块或数学公式时才换行；列表项之间不要留空行。数学公式用 LaTeX（$...$ 或 $$...$$）。思考保持简洁，避免反复重述。".to_string(),
-    (true, false) => "你是一位智能助手。直接给出答案，回答简洁、自然流畅，不要小标题或编号。输出必须紧凑：不要输出空行；只有在真正需要分隔段落、列表项、表格行、代码块或数学公式时才换行；列表项之间不要留空行。数学公式用 LaTeX（$...$ 或 $$...$$）。思考保持简洁，避免反复重述。".to_string(),
-    (_, true) => "You are a helpful assistant that can see the user's screenshot. Use it as visual context to understand and answer, whether extracting information, explaining concepts, assisting with tasks, or any relevant topic. Keep responses short and natural, with no headings or bullet points unless a list is genuinely useful. Keep output compact: do not output blank lines; use a single newline only when needed for clear paragraph boundaries, list items, table rows, code blocks, or math; never put empty lines between list items. Use LaTeX ($...$ or $$...$$) for math. Think briefly; avoid repeating yourself.".to_string(),
-    (_, false) => "You are a helpful assistant. Answer directly. Keep responses short and natural, with no headings or bullet points unless a list is genuinely useful. Keep output compact: do not output blank lines; use a single newline only when needed for clear paragraph boundaries, list items, table rows, code blocks, or math; never put empty lines between list items. Use LaTeX ($...$ or $$...$$) for math. Think briefly; avoid repeating yourself.".to_string(),
+    (true, true) => "你是一位智能助手，能够看到用户分享的截图。请将其作为视觉上下文来理解和回答。".to_string(),
+    (true, false) => "你是一位智能助手。直接回答用户问题。".to_string(),
+    (_, true) => "You are a helpful assistant that can see the user's screenshot. Use it as visual context to answer.".to_string(),
+    (_, false) => "You are a helpful assistant. Answer the user's question directly.".to_string(),
   }
-}
-
-/**
- * 关闭思考模式时附加到系统提示词末尾的指令。
- * 提示词层兜底：当 provider 不识别 thinking={type:"disabled"} 字段（如某些第三方代理）时，
- * 仍可让模型按指令省略思考过程。
- */
-pub fn no_think_instruction(language: &str) -> &'static str {
-    if language.starts_with("zh") {
-        "\n\n严格要求：直接给出最终答案，不要输出任何思考过程、推理步骤或 <think> 内容。保持输出紧凑，不要输出空行。"
-    } else {
-        "\n\nStrict requirement: output only the final answer; do NOT include any thinking, reasoning steps, or <think> content. Keep output compact; do not output blank lines."
-    }
 }
 
 /**
@@ -829,6 +828,10 @@ pub fn default_question_prompt(language: &str, has_image: bool) -> String {
 
 fn default_true() -> bool {
     true
+}
+
+pub fn no_think_instruction(_language: &str) -> &'static str {
+    "\n\nDo not reveal hidden reasoning."
 }
 
 fn default_false() -> bool {
@@ -1103,6 +1106,8 @@ mod tests {
             base_url: APPLE_INTELLIGENCE_BASE_URL.to_string(),
             available_models: vec![],
             enabled_models: vec!["apple-foundation".to_string()],
+            reasoning_effort: None,
+            web_search_enabled: None,
         });
         s.providers.push(ModelProvider {
             id: "cloud".to_string(),
@@ -1112,6 +1117,8 @@ mod tests {
             base_url: "https://api.example.com/v1".to_string(),
             available_models: vec![],
             enabled_models: vec!["gpt-4o".to_string()],
+            reasoning_effort: None,
+            web_search_enabled: None,
         });
         s.translator_provider_id = "apple".to_string();
         s.translator_model = "apple-foundation".to_string();
@@ -1137,6 +1144,8 @@ mod tests {
             base_url: "https://api.example.com/v1".to_string(),
             available_models: vec![],
             enabled_models: vec!["m".to_string()],
+            reasoning_effort: None,
+            web_search_enabled: None,
         });
         let s = sanitize_settings(s);
         let p = s.get_provider("p").unwrap();
@@ -1155,6 +1164,8 @@ mod tests {
             base_url: "https://api.example.com/v1".to_string(),
             available_models: vec![],
             enabled_models: vec!["m".to_string()],
+            reasoning_effort: None,
+            web_search_enabled: None,
         });
         let s = sanitize_settings(s);
         let p = s.get_provider("p").unwrap();
@@ -1176,6 +1187,8 @@ mod tests {
             base_url: "https://api.example.com/v1".to_string(),
             available_models: vec![],
             enabled_models: vec!["m".to_string()],
+            reasoning_effort: None,
+            web_search_enabled: None,
         });
         let s = sanitize_settings(s);
         let p = s.get_provider("p").unwrap();
@@ -1193,6 +1206,8 @@ mod tests {
             base_url: "https://api.example.com/v1".to_string(),
             available_models: vec![],
             enabled_models: vec![],
+            reasoning_effort: None,
+            web_search_enabled: None,
         });
         s.translator_provider_id = "p".to_string();
         s.screenshot_translation.provider_id = "p".to_string();
@@ -1233,6 +1248,8 @@ mod tests {
             base_url: "https://api.example.com/v1".to_string(),
             available_models: vec![],
             enabled_models: vec!["m".to_string()],
+            reasoning_effort: None,
+            web_search_enabled: None,
         });
         s.lens.provider_id = "nonexistent".to_string();
         s.lens.model = "ghost-model".to_string();
