@@ -42,6 +42,15 @@ type SearchSource = {
   url: string
 }
 
+type PendingStreamUpdate = {
+  delta: string
+  reasoningDelta: string
+  searchQuery?: string
+  searchResults?: string
+  done?: boolean
+  full?: string
+}
+
 function parseSearchSources(raw?: string): SearchSource[] {
   if (!raw) return []
   return raw
@@ -183,6 +192,8 @@ export default function Lens() {
   const prevStreamingRef = useRef(false)
   const preparingSendRef = useRef(false)
   const answerFinishedRef = useRef(false)
+  const pendingStreamRef = useRef<PendingStreamUpdate | null>(null)
+  const streamFlushFrameRef = useRef<number | null>(null)
   // Stream 真实结束（成功 / 错误 / 用户主动取消）后才置 true，
   // 让历史持久化 effect 只在这一次 rerun 触发 push；restoreHistory / enterSelect / resetBeforeHide 防御性清零，
   // 避免恢复历史时 setMessages 触发 effect 把恢复的对话又当新条目写一遍历史。
@@ -210,6 +221,67 @@ export default function Lens() {
     // 必须在 setStreaming(false) 前置 true：历史持久化 effect 依赖 streaming 变化触发。
     justFinishedStreamRef.current = true
     setStreaming(false)
+  }, [])
+
+  const flushPendingStream = useCallback(() => {
+    if (streamFlushFrameRef.current !== null) {
+      cancelAnimationFrame(streamFlushFrameRef.current)
+      streamFlushFrameRef.current = null
+    }
+    const pending = pendingStreamRef.current
+    if (!pending) return
+    pendingStreamRef.current = null
+
+    setMessages(prev => {
+      const last = prev[prev.length - 1]
+      if (!last || last.role !== 'assistant') return prev
+
+      let nextLast = last
+      let changed = false
+
+      if (pending.searchQuery !== undefined && pending.searchQuery !== nextLast.searchQuery) {
+        nextLast = { ...nextLast, searchQuery: pending.searchQuery }
+        changed = true
+      }
+      if (pending.searchResults !== undefined && pending.searchResults !== nextLast.searchResults) {
+        nextLast = { ...nextLast, searchResults: pending.searchResults }
+        changed = true
+      }
+      if (pending.reasoningDelta) {
+        nextLast = { ...nextLast, reasoning: (nextLast.reasoning ?? '') + pending.reasoningDelta }
+        changed = true
+      }
+      if (pending.delta) {
+        nextLast = normalizeThinkingTags({ ...nextLast, content: nextLast.content + pending.delta })
+        changed = true
+      }
+      if (pending.done && pending.full && pending.full.length > nextLast.content.length) {
+        nextLast = normalizeThinkingTags({ ...nextLast, content: pending.full })
+        changed = true
+      }
+
+      return changed ? [...prev.slice(0, -1), nextLast] : prev
+    })
+  }, [])
+
+  const scheduleStreamFlush = useCallback((immediate = false) => {
+    if (immediate) {
+      flushPendingStream()
+      return
+    }
+    if (streamFlushFrameRef.current !== null) return
+    streamFlushFrameRef.current = requestAnimationFrame(() => {
+      streamFlushFrameRef.current = null
+      flushPendingStream()
+    })
+  }, [flushPendingStream])
+
+  const clearPendingStream = useCallback(() => {
+    if (streamFlushFrameRef.current !== null) {
+      cancelAnimationFrame(streamFlushFrameRef.current)
+      streamFlushFrameRef.current = null
+    }
+    pendingStreamRef.current = null
   }, [])
 
   const cancelPendingMotion = useCallback(() => {
@@ -279,6 +351,7 @@ export default function Lens() {
   const enterSelect = useCallback(async () => {
     const curMode = readModeFromHash()
     cancelPendingMotion()
+    clearPendingStream()
     const motionSeq = motionSeqRef.current
     fullscreenMetricsRef.current = null
     // 防御：reset 流程会 setMessages([]) + setStreaming(false)，理论上 messages.length===0 effect 不会进
@@ -439,7 +512,7 @@ export default function Lens() {
       if (motionSeq === motionSeqRef.current) setWindows([])
     }
     focusLensInput()
-  }, [cancelPendingMotion, focusLensInput])
+  }, [cancelPendingMotion, clearPendingStream, focusLensInput])
 
   useEffect(() => {
     void enterSelect()
@@ -551,39 +624,25 @@ export default function Lens() {
     let unlisten: (() => void) | undefined
     api.onLensStream((payload: LensStreamPayload) => {
       if (payload.imageId !== imageIdRef.current) return
-      setMessages(prev => {
-        const last = prev[prev.length - 1]
-        if (!last || last.role !== 'assistant') return prev
-
-        let nextLast = last
-        let changed = false
-
-        if (payload.searchQuery !== undefined && payload.searchQuery !== nextLast.searchQuery) {
-          nextLast = { ...nextLast, searchQuery: payload.searchQuery }
-          changed = true
-        }
-        if (payload.searchResults !== undefined && payload.searchResults !== nextLast.searchResults) {
-          nextLast = { ...nextLast, searchResults: payload.searchResults }
-          changed = true
-        }
-        if (payload.reasoningDelta) {
-          nextLast = { ...nextLast, reasoning: (nextLast.reasoning ?? '') + payload.reasoningDelta }
-          changed = true
-        }
-        if (payload.delta) {
-          nextLast = normalizeThinkingTags({ ...nextLast, content: nextLast.content + payload.delta })
-          changed = true
-        }
-        if (payload.done && payload.full && payload.full.length > nextLast.content.length) {
-          nextLast = normalizeThinkingTags({ ...nextLast, content: payload.full })
-          changed = true
-        }
-
-        return changed ? [...prev.slice(0, -1), nextLast] : prev
-      })
+      const pending = pendingStreamRef.current ?? {
+        delta: '',
+        reasoningDelta: '',
+      }
+      if (payload.searchQuery !== undefined) pending.searchQuery = payload.searchQuery
+      if (payload.searchResults !== undefined) pending.searchResults = payload.searchResults
+      if (payload.reasoningDelta) pending.reasoningDelta += payload.reasoningDelta
+      if (payload.delta) pending.delta += payload.delta
+      if (payload.done) {
+        pending.done = true
+        pending.full = payload.full
+      }
+      pendingStreamRef.current = pending
 
       if (payload.done) {
+        scheduleStreamFlush(true)
         finishAnswering()
+      } else {
+        scheduleStreamFlush()
       }
     }).then((dispose) => {
       if (cancelled) dispose()
@@ -591,9 +650,14 @@ export default function Lens() {
     }).catch(err => console.error(err))
     return () => {
       cancelled = true
+      if (streamFlushFrameRef.current !== null) {
+        cancelAnimationFrame(streamFlushFrameRef.current)
+        streamFlushFrameRef.current = null
+      }
+      pendingStreamRef.current = null
       unlisten?.()
     }
-  }, [finishAnswering])
+  }, [finishAnswering, scheduleStreamFlush])
 
   // messages 变化时自动滚动：正序滚到底（看新内容），倒序滚到顶（最新在顶）
   useEffect(() => {
@@ -623,6 +687,7 @@ export default function Lens() {
   // barNoTransition：禁用 left/top/width transition，避免 380ms 动画被 hide 暂停后下次 show 续播。
   const resetBeforeHide = useCallback(() => {
     cancelPendingMotion()
+    clearPendingStream()
     fullscreenMetricsRef.current = null
     // 防御：和 enterSelect 同理 —— reset 路径不该走持久化
     justFinishedStreamRef.current = false
@@ -651,7 +716,7 @@ export default function Lens() {
     // 让任何还没落地的 takeLensSelection 老 promise 作废，避免关闭后 setSelectionText 拖回来
     selectionReqIdRef.current++
     focusReqIdRef.current++
-  }, [cancelPendingMotion, viewport, metrics])
+  }, [cancelPendingMotion, clearPendingStream, viewport, metrics])
 
   // 全局 Esc：流式时取消流 / 否则关闭
   useEffect(() => {
@@ -660,7 +725,8 @@ export default function Lens() {
       if (preparingSendRef.current) return
       if (stageRef.current === 'answering' && streaming) {
         try { await api.lensCancelStream() } catch (err) { console.error(err) }
-        setStreaming(false)
+        flushPendingStream()
+        finishAnswering()
         return
       }
       resetBeforeHide()
@@ -668,7 +734,7 @@ export default function Lens() {
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [streaming, resetBeforeHide])
+  }, [streaming, resetBeforeHide, flushPendingStream, finishAnswering])
 
   // drawMode 键盘:Cmd+Z 撤销最后一支箭头,Esc 退出 drawMode(arrows 保留)
   useEffect(() => {
@@ -1168,6 +1234,7 @@ export default function Lens() {
 
   const doSend = async (question: string) => {
     if (streaming) return
+    clearPendingStream()
     setHistoryOpen(false)
     answerFinishedRef.current = false
 
@@ -1257,6 +1324,7 @@ export default function Lens() {
 
   const handleStop = async () => {
     try { await api.lensCancelStream() } catch (err) { console.error(err) }
+    flushPendingStream()
     // 用户主动取消但已经流出部分内容，也持久化 —— 关掉再开历史能接着问
     finishAnswering()
   }
@@ -1285,6 +1353,7 @@ export default function Lens() {
   // 取消任何正在跑的流，避免后端继续 emit delta 灌入新恢复的 messages（如果新旧 imageId 巧合相同会污染）
   const restoreHistory = (item: HistoryItem) => {
     setHistoryOpen(false)
+    clearPendingStream()
     if (streaming) {
       void api.lensCancelStream().catch(err => console.error(err))
     }
@@ -1926,25 +1995,26 @@ export default function Lens() {
                           {m.searchQuery && (() => {
                             const sources = parseSearchSources(m.searchResults)
                             return (
-                              <div className="not-prose group/search relative z-10 mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full border border-blue-200/70 dark:border-blue-900/50 bg-blue-50/70 dark:bg-blue-950/25 px-2.5 py-1 text-[12px] leading-none text-blue-700 dark:text-blue-300">
-                                <Search size={12} />
-                                <span className="truncate">{lang === 'zh' ? '已联网搜索' : 'Searched web'}: {m.searchQuery}</span>
-                                {sources.length > 0 && <Link2 size={11} className="shrink-0 opacity-70" />}
+                              <div className="not-prose group/search relative z-10 mb-2 flex max-w-full items-center gap-1.5 text-[12px] leading-none text-neutral-500 dark:text-neutral-400">
+                                <Search size={11} className="shrink-0 opacity-60" />
+                                <span className="truncate">{lang === 'zh' ? '已搜索' : 'Searched'}: {m.searchQuery}</span>
                                 {sources.length > 0 && (
-                                  <div className="pointer-events-none absolute left-0 top-full z-50 mt-1.5 hidden w-[min(360px,calc(100vw-48px))] rounded-xl border border-black/[0.06] dark:border-white/[0.08] bg-white/98 dark:bg-neutral-950/98 p-2 shadow-[0_18px_48px_-18px_rgba(0,0,0,0.45)] backdrop-blur-md group-hover/search:block group-focus-within/search:block group-hover/search:pointer-events-auto group-focus-within/search:pointer-events-auto">
-                                    <div className="max-h-[220px] overflow-y-auto custom-scrollbar pr-1">
+                                  <span className="shrink-0 ml-0.5 text-[11px] opacity-50">
+                                    · {sources.length} {lang === 'zh' ? '来源' : sources.length === 1 ? 'source' : 'sources'}
+                                  </span>
+                                )}
+                                {sources.length > 0 && (
+                                  <div className="pointer-events-none invisible absolute left-0 top-full z-50 mt-1 w-[min(340px,calc(100vw-48px))] rounded-lg border border-black/[0.06] dark:border-white/[0.08] bg-white dark:bg-neutral-900 p-1.5 shadow-lg opacity-0 transition-[opacity,visibility] duration-150 group-hover/search:visible group-hover/search:opacity-100 group-hover/search:pointer-events-auto">
+                                    <div className="max-h-[200px] overflow-y-auto custom-scrollbar">
                                       {sources.map((source, i) => (
                                         <button
                                           key={`${source.url}-${i}`}
                                           type="button"
                                           onClick={() => { void api.openExternal(source.url) }}
-                                          className="mb-1.5 last:mb-0 flex w-full items-start gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+                                          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-800"
                                         >
-                                          <Link2 size={12} className="mt-0.5 shrink-0 text-blue-500" />
-                                          <span className="min-w-0">
-                                            <span className="block truncate text-[12px] font-medium leading-4 text-neutral-900 dark:text-neutral-100">{source.title}</span>
-                                            <span className="block truncate text-[10.5px] leading-4 text-neutral-400">{source.url}</span>
-                                          </span>
+                                          <Link2 size={11} className="shrink-0 text-neutral-400" />
+                                          <span className="min-w-0 truncate text-[11.5px] text-neutral-700 dark:text-neutral-300">{source.title || source.url}</span>
                                         </button>
                                       ))}
                                     </div>

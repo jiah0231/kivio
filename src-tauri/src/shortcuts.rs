@@ -307,18 +307,23 @@ pub(crate) fn capture_active_selection() -> Option<String> {
     // 等用户松开 Lens 热键修饰键，避免 Cmd+C 与残留 Shift 等组合成 Cmd+Shift+C。
     wait_for_copy_shortcut_modifiers_to_clear(Duration::from_millis(450));
     send_copy_shortcut();
-    std::thread::sleep(Duration::from_millis(150));
-
-    let captured: Option<String> = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
-    let text_changed = match (&snapshot, &captured) {
-        (Some(a), Some(b)) => a != b,
-        (None, Some(_)) => true,
-        _ => false,
-    };
-    let after_change_count = clipboard_change_count();
-    let pasteboard_changed = match (before_change_count, after_change_count) {
-        (Some(before), Some(after)) => before != after,
-        _ => false,
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let (captured, after_change_count, text_changed, pasteboard_changed) = loop {
+        std::thread::sleep(Duration::from_millis(25));
+        let captured = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
+        let text_changed = match (&snapshot, &captured) {
+            (Some(a), Some(b)) => a != b,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        let after_change_count = clipboard_change_count();
+        let pasteboard_changed = match (before_change_count, after_change_count) {
+            (Some(before), Some(after)) => before != after,
+            _ => false,
+        };
+        if text_changed || pasteboard_changed || std::time::Instant::now() >= deadline {
+            break (captured, after_change_count, text_changed, pasteboard_changed);
+        }
     };
     eprintln!(
     "[lens-capture] captured present={} len={} text_changed={} pasteboard_changed={} change_count={:?}",

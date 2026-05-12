@@ -1547,14 +1547,18 @@ pub async fn call_vision_api(
       .map_err(|e| format!("Vision API parse JSON: {} (body: {})", e, first_raw.chars().take(500).collect::<String>()))?;
     if let Some((call_id, query)) = extract_tavily_tool_call_query(&first_val, use_responses, use_messages) {
         // 模型要搜索 — 调 Tavily，注入结果，再流式发第二次
-        let _ = app.emit(event_name, serde_json::json!({
-          "imageId": image_id, "kind": stream_kind, "delta": "", "searchQuery": query,
-        }));
+        if stream {
+          let _ = app.emit(event_name, serde_json::json!({
+            "imageId": image_id, "kind": stream_kind, "delta": "", "searchQuery": query,
+          }));
+        }
         let search_result = tavily_search(&state.http, &tavily_key, &query).await
           .unwrap_or_else(|e| format!("Search failed: {e}"));
-        let _ = app.emit(event_name, serde_json::json!({
-          "imageId": image_id, "kind": stream_kind, "delta": "", "searchResults": search_result,
-        }));
+        if stream {
+          let _ = app.emit(event_name, serde_json::json!({
+            "imageId": image_id, "kind": stream_kind, "delta": "", "searchResults": search_result,
+          }));
+        }
         // 注入 tool result 到 body，去掉 tools
         append_tavily_tool_result(
           &mut body,
