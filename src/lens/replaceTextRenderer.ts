@@ -121,6 +121,136 @@ export function replaceGroupSourceInkPx(slots: LensReplaceRenderSlot[]): number 
   return Math.max(reported, Math.min(geometryTarget, reported * 1.6))
 }
 
+function shiftedSlot(slot: LensReplaceRenderSlot, dy: number): LensReplaceRenderSlot {
+  if (Math.abs(dy) < 0.001) return slot
+  return {
+    ...slot,
+    bounds: { ...slot.bounds, y: slot.bounds.y + dy },
+    anchor: {
+      ...slot.anchor,
+      y: slot.anchor.y + dy,
+      baselineY: slot.anchor.baselineY + dy,
+    },
+  }
+}
+
+function isParagraphGroup(slots: LensReplaceRenderSlot[]) {
+  return slots.length > 0 && slots.every(slot => slot.flow === 'paragraph_flow')
+}
+
+/**
+ * OCR line boxes can contain a single very large y jump (math superscript,
+ * merged display formula, detector jitter). Rendering at those absolute y
+ * anchors tears one translated sentence into two pieces with a giant blank
+ * stripe in the middle. For a semantic paragraph the source baselines are only
+ * a typography hint, so collapse outlier gaps to the paragraph's typical pitch.
+ * The first baseline stays fixed and each following used baseline advances by
+ * a robust median pitch capped by the source line-box height.
+ */
+export function compactReplaceParagraphRenderSlots(
+  slots: LensReplaceRenderSlot[],
+  layout: ReplaceTextFlowLayout,
+  groupShift = 0,
+): LensReplaceRenderSlot[] {
+  if (!isParagraphGroup(slots)) {
+    return slots.map(slot => shiftedSlot(slot, groupShift))
+  }
+
+  const usedIndices = slots
+    .map((_, index) => (layout.slots[index]?.lines.length ?? 0) > 0 ? index : -1)
+    .filter(index => index >= 0)
+  if (usedIndices.length === 0) {
+    return slots.map(slot => shiftedSlot(slot, groupShift))
+  }
+
+  const lineBox = median(slots.map(slot => slot.bounds.height)) ?? 1
+  const sourceDeltas = slots
+    .slice(1)
+    .map((slot, index) => slot.anchor.y - slots[index].anchor.y)
+    .filter(delta => Number.isFinite(delta) && delta > 0)
+  const sourcePitch = median(sourceDeltas) ?? lineBox * 1.15
+  const pitch = Math.max(lineBox * 0.92, Math.min(sourcePitch, lineBox * 1.55))
+  const firstIndex = usedIndices[0]
+  const firstAnchorY = slots[firstIndex].anchor.y + groupShift
+  let usedOrdinal = 0
+
+  return slots.map((slot, index) => {
+    if ((layout.slots[index]?.lines.length ?? 0) === 0) {
+      return shiftedSlot(slot, groupShift)
+    }
+    const targetAnchorY = firstAnchorY + usedOrdinal * pitch
+    usedOrdinal += 1
+    return shiftedSlot(slot, targetAnchorY - slot.anchor.y)
+  })
+}
+
+function horizontalOverlapRatio(a: LensReplaceRenderSlot, b: LensReplaceRenderSlot) {
+  const left = Math.max(a.bounds.x, b.bounds.x)
+  const right = Math.min(a.bounds.x + a.bounds.width, b.bounds.x + b.bounds.width)
+  return Math.max(0, right - left) / Math.max(1, Math.min(a.bounds.width, b.bounds.width))
+}
+
+function sourceBounds(slots: LensReplaceRenderSlot[]) {
+  return {
+    top: Math.min(...slots.map(slot => slot.bounds.y)),
+    bottom: Math.max(...slots.map(slot => slot.bounds.y + slot.bounds.height)),
+  }
+}
+
+function usedRenderedBottom(slots: LensReplaceRenderSlot[], layout: ReplaceTextFlowLayout) {
+  const bottoms = slots
+    .map((slot, index) => (layout.slots[index]?.lines.length ?? 0) > 0
+      ? slot.bounds.y + slot.bounds.height
+      : Number.NEGATIVE_INFINITY)
+    .filter(value => Number.isFinite(value))
+  return bottoms.length > 0 ? Math.max(...bottoms) : Number.NEGATIVE_INFINITY
+}
+
+type PreviousParagraphPlan = {
+  sourceSlots: LensReplaceRenderSlot[]
+  renderedSlots: LensReplaceRenderSlot[]
+  layout: ReplaceTextFlowLayout
+  groupShift: number
+}
+
+/**
+ * Chinese translations are often shorter than English. If a paragraph uses
+ * only the first N of M source rows, keeping the next paragraph at its original
+ * absolute y leaves M-N empty rows on screen. Preserve the *original paragraph
+ * gap* but remove the unused tail rows. This is intentionally limited to the
+ * same text column and to nearby body blocks so menus/tables never get reflowed.
+ */
+export function replaceParagraphContinuationShift(
+  previous: PreviousParagraphPlan,
+  currentSlots: LensReplaceRenderSlot[],
+): number {
+  if (!isParagraphGroup(previous.sourceSlots) || currentSlots.length === 0) return 0
+
+  const currentIsParagraph = isParagraphGroup(currentSlots)
+  const currentIsWideLine = currentSlots.length === 1
+    && currentSlots[0].flow === 'exact_line'
+    && currentSlots[0].kind === 'line'
+    && currentSlots[0].bounds.width >= (median(previous.sourceSlots.map(slot => slot.bounds.width)) ?? 1) * 0.5
+  if (!currentIsParagraph && !currentIsWideLine) return 0
+
+  const previousLast = previous.sourceSlots[previous.sourceSlots.length - 1]
+  const currentFirst = currentSlots[0]
+  const lineBox = median([
+    ...previous.sourceSlots.map(slot => slot.bounds.height),
+    ...currentSlots.map(slot => slot.bounds.height),
+  ]) ?? 1
+  const rawGap = sourceBounds(currentSlots).top - sourceBounds(previous.sourceSlots).bottom
+  if (rawGap < -lineBox * 0.35 || rawGap > lineBox * 1.6) return 0
+  if (Math.abs(previousLast.anchor.x - currentFirst.anchor.x) > lineBox * 1.8) return 0
+  if (horizontalOverlapRatio(previousLast, currentFirst) < 0.55) return 0
+
+  const renderedBottom = usedRenderedBottom(previous.renderedSlots, previous.layout)
+  if (!Number.isFinite(renderedBottom)) return previous.groupShift
+  const shiftedSourceBottom = sourceBounds(previous.sourceSlots).bottom + previous.groupShift
+  const unusedTail = Math.max(0, shiftedSourceBottom - renderedBottom)
+  return previous.groupShift - unusedTail
+}
+
 function contentBlockHeight(
   ctx: CanvasRenderingContext2D,
   lines: string[],
@@ -221,6 +351,8 @@ export function renderReplaceTextGroups(
     slotsByGroup.set(slot.groupId, groupSlots)
   }
 
+  let previousParagraph: PreviousParagraphPlan | null = null
+
   for (const group of groups) {
     const groupSlots = [...(slotsByGroup.get(group.id) ?? [])]
       .sort((left, right) => left.anchor.y - right.anchor.y || left.anchor.x - right.anchor.x)
@@ -240,7 +372,12 @@ export function renderReplaceTextGroups(
       },
     )
 
-    groupSlots.forEach((slot, index) => {
+    const groupShift = previousParagraph
+      ? replaceParagraphContinuationShift(previousParagraph, groupSlots)
+      : 0
+    const renderSlots = compactReplaceParagraphRenderSlots(groupSlots, layout, groupShift)
+
+    renderSlots.forEach((slot, index) => {
       const slotLayout = layout.slots[index]
       if (!slotLayout || slotLayout.lines.length === 0) return
       ctx.save()
@@ -251,5 +388,16 @@ export function renderReplaceTextGroups(
       else drawSlotText(ctx, slot, slotLayout, layout)
       ctx.restore()
     })
+
+    if (isParagraphGroup(groupSlots)) {
+      previousParagraph = {
+        sourceSlots: groupSlots,
+        renderedSlots: renderSlots,
+        layout,
+        groupShift,
+      }
+    } else if (!(previousParagraph && groupShift !== 0)) {
+      previousParagraph = null
+    }
   }
 }
