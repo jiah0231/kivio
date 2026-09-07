@@ -190,6 +190,29 @@ describe('replacement translation paragraph compaction', () => {
     expect(shiftedCurrentTop - previousRenderedBottom).toBe(20)
   })
 
+  it('collapses an oversized OCR gap when one source sentence was falsely split into two groups', () => {
+    const previousSource = [
+      slotAt('paragraph_flow', 0, 20),
+      slotAt('paragraph_flow', 1, 62),
+    ]
+    const previousLayout = fakeLayout([true, true])
+    const previousRendered = compactReplaceParagraphRenderSlots(previousSource, previousLayout)
+    const currentSource = [slotAt('paragraph_flow', 0, 180, 'r1')]
+
+    const shift = replaceParagraphContinuationShift({
+      sourceSlots: previousSource,
+      renderedSlots: previousRendered,
+      layout: previousLayout,
+      groupShift: 0,
+      sourceText: 'the negative log likelihood still corresponds',
+    }, currentSource, 'to the estimated coding bits.')
+
+    const previousBottom = previousRendered[1].bounds.y + previousRendered[1].bounds.height
+    const shiftedGap = currentSource[0].bounds.y + shift - previousBottom
+    expect(shift).toBeLessThan(0)
+    expect(shiftedGap).toBeCloseTo(34 * 0.65, 5)
+  })
+
   it('does not pull a distant paragraph across a real section break', () => {
     const previousSource = [slotAt('paragraph_flow', 0, 20), slotAt('paragraph_flow', 1, 62)]
     const previousLayout = fakeLayout([true, false])
@@ -201,7 +224,8 @@ describe('replacement translation paragraph compaction', () => {
       renderedSlots: previousRendered,
       layout: previousLayout,
       groupShift: 0,
-    }, currentSource)).toBe(0)
+      sourceText: 'This is a complete sentence.',
+    }, currentSource, 'A new paragraph starts here.')).toBe(0)
   })
 })
 
