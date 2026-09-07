@@ -2,8 +2,8 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } f
 import type { LensReplaceGroup, LensReplaceRenderSlot } from '../api/tauri'
 import { copyToClipboard } from '../utils/clipboard'
 import { DRAG_THRESHOLD } from './layout'
-import { layoutReplaceTextFlow, normalizeReplaceParagraph, replaceTextVerticalOffset, selectedGroupsText, type ReplaceTextFlowSlotLayout } from './replaceTextLayout'
-import { calibrateReplaceFontPx } from './replaceTextRenderer'
+import { selectedGroupsText } from './replaceTextLayout'
+import { renderReplaceTextGroups } from './replaceTextRenderer'
 import type { CapturedFrame } from './types'
 
 type ReplaceTranslateOverlayProps = {
@@ -24,8 +24,6 @@ type ReplaceTranslateOverlayProps = {
 
 type SelectionRect = { x1: number; y1: number; x2: number; y2: number }
 
-const REPLACE_FONT_FAMILY = 'system-ui, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif'
-
 function normalizedRect(selection: SelectionRect) {
   return {
     x: Math.min(selection.x1, selection.x2),
@@ -33,89 +31,6 @@ function normalizedRect(selection: SelectionRect) {
     width: Math.abs(selection.x2 - selection.x1),
     height: Math.abs(selection.y2 - selection.y1),
   }
-}
-
-function textX(bounds: LensReplaceRenderSlot['bounds'], align: LensReplaceRenderSlot['align'], padding: number) {
-  return align === 'center'
-    ? bounds.x + bounds.width / 2
-    : align === 'right'
-      ? bounds.x + bounds.width - padding
-      : bounds.x + padding
-}
-
-function anchoredTextX(slot: LensReplaceRenderSlot, padding: number) {
-  // Left-aligned text (exact lines AND table cells) starts at the measured ink
-  // anchor so translations don't slide toward the region/cell border.
-  return slot.align === 'left' ? slot.anchor.x : textX(slot.bounds, slot.align, padding)
-}
-
-function anchoredTextY(
-  slot: LensReplaceRenderSlot,
-  innerHeight: number,
-  contentHeight: number,
-  padding: number,
-) {
-  if (slot.flow === 'exact_line' || slot.verticalAlign === 'top') return slot.anchor.y
-  return slot.bounds.y + padding + replaceTextVerticalOffset(slot.kind, innerHeight, contentHeight)
-}
-
-function drawNormalSlotText(
-  ctx: CanvasRenderingContext2D,
-  slot: LensReplaceRenderSlot,
-  layout: ReplaceTextFlowSlotLayout,
-  fontPx: number,
-  lineHeight: number,
-  padding: number,
-) {
-  const { bounds } = slot
-  const innerHeight = Math.max(1, bounds.height - padding * 2)
-  ctx.font = `${fontPx}px ${REPLACE_FONT_FAMILY}`
-  ctx.fillStyle = slot.sourceColor
-  ctx.textBaseline = 'top'
-  ctx.textAlign = slot.align
-  const x = anchoredTextX(slot, padding)
-  let y = anchoredTextY(slot, innerHeight, layout.contentHeight, padding)
-  for (const line of layout.lines) {
-    ctx.fillText(line, x, y)
-    y += lineHeight
-  }
-}
-
-function drawSafelyScaledSlotText(
-  ctx: CanvasRenderingContext2D,
-  slot: LensReplaceRenderSlot,
-  layout: ReplaceTextFlowSlotLayout,
-  fontPx: number,
-  lineHeight: number,
-  safeScale: number,
-  padding: number,
-) {
-  const offscreen = document.createElement('canvas')
-  offscreen.width = Math.max(1, Math.ceil(slot.bounds.width / safeScale))
-  offscreen.height = Math.max(1, Math.ceil(slot.bounds.height / safeScale))
-  const offscreenCtx = offscreen.getContext('2d')
-  if (!offscreenCtx) return
-  const virtualPadding = padding / safeScale
-  const innerHeight = Math.max(1, offscreen.height - virtualPadding * 2)
-  offscreenCtx.font = `${fontPx}px ${REPLACE_FONT_FAMILY}`
-  offscreenCtx.fillStyle = slot.sourceColor
-  offscreenCtx.textBaseline = 'top'
-  offscreenCtx.textAlign = slot.align
-  const anchorX = (slot.anchor.x - slot.bounds.x) / safeScale
-  const anchorY = (slot.anchor.y - slot.bounds.y) / safeScale
-  const x = slot.align === 'left'
-    ? anchorX
-    : slot.align === 'center'
-    ? offscreen.width / 2
-    : offscreen.width - virtualPadding
-  let y = slot.flow === 'exact_line' || slot.verticalAlign === 'top'
-    ? anchorY
-    : virtualPadding + replaceTextVerticalOffset(slot.kind, innerHeight, layout.contentHeight)
-  for (const line of layout.lines) {
-    offscreenCtx.fillText(line, x, y)
-    y += lineHeight
-  }
-  ctx.drawImage(offscreen, slot.bounds.x, slot.bounds.y, slot.bounds.width, slot.bounds.height)
 }
 
 export function ReplaceTranslateOverlay({
@@ -171,65 +86,7 @@ export function ReplaceTranslateOverlay({
       naturalSizeRef.current = { w: canvas.width, h: canvas.height }
       context.clearRect(0, 0, canvas.width, canvas.height)
       context.drawImage(image, 0, 0)
-      const slotsByGroup = new Map<string, LensReplaceRenderSlot[]>()
-      for (const slot of slots) {
-        const groupSlots = slotsByGroup.get(slot.groupId) ?? []
-        groupSlots.push(slot)
-        slotsByGroup.set(slot.groupId, groupSlots)
-      }
-      for (const group of groups) {
-        const groupSlots = (slotsByGroup.get(group.id) ?? [])
-          .sort((left, right) => left.anchor.y - right.anchor.y || left.anchor.x - right.anchor.x)
-        if (groupSlots.length === 0) continue
-        const rawText = group.translated.trim() || group.sourceText
-        const text = groupSlots.some(slot => slot.flow === 'paragraph_flow')
-          ? normalizeReplaceParagraph(rawText)
-          : rawText.replace(/\r\n?/g, '\n')
-        if (!text) continue
-
-        // Rust's sourceFontPx is the measured source *ink* height. Canvas font
-        // size is an em-box, so calibrate it before fitting; using the ink value
-        // directly made translated text systematically smaller than the source.
-        const sourceInkPx = Math.max(...groupSlots.map(slot => slot.sourceFontPx))
-        const sourceFontPx = calibrateReplaceFontPx(context, sourceInkPx, text.slice(0, 96))
-        const isSourceLineFlow = groupSlots.every(slot => slot.flow === 'paragraph_flow' || slot.flow === 'exact_line')
-        const padding = isSourceLineFlow ? 0 : Math.max(2, Math.min(6, sourceFontPx * 0.2))
-        const layout = layoutReplaceTextFlow(
-          text,
-          groupSlots.map(slot => {
-            const leftInset = slot.align === 'left'
-              ? Math.max(0, slot.anchor.x - slot.bounds.x)
-              : padding
-            return {
-              width: Math.max(1, slot.bounds.width - leftInset - padding),
-              height: Math.max(1, slot.bounds.height - padding * 2),
-              maxLines: slot.flow === 'paragraph_flow' || slot.flow === 'exact_line' ? 1 : undefined,
-            }
-          }),
-          sourceFontPx,
-          (value, fontPx) => {
-            context.font = `${fontPx}px ${REPLACE_FONT_FAMILY}`
-            return context.measureText(value).width
-          },
-        )
-        groupSlots.forEach((slot, index) => {
-          const slotLayout = layout.slots[index]
-          if (!slotLayout || slotLayout.lines.length === 0) return
-          context.save()
-          context.beginPath()
-          context.rect(slot.bounds.x, slot.bounds.y, slot.bounds.width, slot.bounds.height)
-          context.clip()
-          // ponytail: scene_patch currently degrades to the plain system-font path
-          // (content stays complete). Rotation threading + a gated photo-redraw
-          // model are deferred to scene-rendering; do not add them speculatively.
-          if (layout.safeScale < 1) {
-            drawSafelyScaledSlotText(context, slot, slotLayout, layout.fontPx, layout.lineHeight, layout.safeScale, padding)
-          } else {
-            drawNormalSlotText(context, slot, slotLayout, layout.fontPx, layout.lineHeight, padding)
-          }
-          context.restore()
-        })
-      }
+      renderReplaceTextGroups(context, groups, slots)
     }
     image.src = cleanedImage
     return () => {
