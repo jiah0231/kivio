@@ -99,8 +99,26 @@ function groupText(group: LensReplaceGroup, slots: LensReplaceRenderSlot[]) {
     : raw.replace(/\r\n?/g, '\n')
 }
 
-function groupSourceInkPx(slots: LensReplaceRenderSlot[]) {
-  return median(slots.map(slot => slot.sourceFontPx)) ?? 16
+/**
+ * Paragraph OCR boxes contain the source line's available vertical geometry.
+ * The backend's sourceFontPx is intentionally conservative and may be ~20-30%
+ * below that geometry; for CJK translations that makes a short translation use
+ * far fewer source baselines, leaving conspicuous blank bands before the next
+ * paragraph fragment. Let paragraph text grow toward the actual line box while
+ * keeping a hard cap at 1.6x the reported ink and at 92% of the slot height.
+ * Standalone labels/headings continue to use the reported source ink exactly.
+ */
+export function replaceGroupSourceInkPx(slots: LensReplaceRenderSlot[]): number {
+  const reported = median(slots.map(slot => slot.sourceFontPx)) ?? 16
+  const paragraphHeights = slots
+    .filter(slot => slot.flow === 'paragraph_flow')
+    .map(slot => slot.bounds.height)
+  if (paragraphHeights.length === 0) return reported
+
+  const lineBox = median(paragraphHeights)
+  if (!lineBox) return reported
+  const geometryTarget = lineBox * 0.92
+  return Math.max(reported, Math.min(geometryTarget, reported * 1.6))
 }
 
 function contentBlockHeight(
@@ -210,7 +228,7 @@ export function renderReplaceTextGroups(
 
     const text = groupText(group, groupSlots)
     if (!text) continue
-    const sourceInkPx = groupSourceInkPx(groupSlots)
+    const sourceInkPx = replaceGroupSourceInkPx(groupSlots)
     const fontPx = calibrateReplaceFontPx(ctx, sourceInkPx, text.slice(0, 96))
     const layout = layoutReplaceTextFlow(
       text,
