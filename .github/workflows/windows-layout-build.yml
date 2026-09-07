@@ -1,0 +1,69 @@
+name: Windows replacement-layout build
+
+on:
+  push:
+    branches:
+      - fix/replacement-translation-layout
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Windows sidecar stub
+        run: npm run build:swift
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Frontend tests
+        run: npm test
+
+      - name: Build Windows NSIS installer
+        run: npx tauri build --bundles nsis
+
+      - name: Package portable zip
+        shell: pwsh
+        run: ./scripts/package-windows-portable.ps1 -Version 2.9.6-layout-fix
+
+      - name: Verify artifacts
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*.exe' | Select-Object -First 1
+          $portable = Get-ChildItem 'src-tauri/target/release/bundle/portable' -Filter '*.zip' | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer missing' }
+          if (-not $portable) { throw 'portable zip missing' }
+          Write-Host "Installer: $($installer.FullName) ($($installer.Length) bytes)"
+          Write-Host "Portable: $($portable.FullName) ($($portable.Length) bytes)"
+          Get-FileHash -Algorithm SHA256 $installer.FullName
+          Get-FileHash -Algorithm SHA256 $portable.FullName
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kivio-Desktop-2.9.6-layout-fix-windows-x64
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/portable/*.zip
