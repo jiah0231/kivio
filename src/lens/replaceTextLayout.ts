@@ -52,7 +52,8 @@ export function normalizeReplaceParagraph(text: string): string {
 
   return lines.reduce((output, line) => {
     if (!output) return line
-    const last = Array.from(output).at(-1) ?? ''
+    const outputChars = Array.from(output)
+    const last = outputChars[outputChars.length - 1] ?? ''
     const first = Array.from(line)[0] ?? ''
     const joinWithoutSpace =
       output.endsWith('-')
