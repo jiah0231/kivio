@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } f
 import type { LensReplaceGroup, LensReplaceRenderSlot } from '../api/tauri'
 import { copyToClipboard } from '../utils/clipboard'
 import { DRAG_THRESHOLD } from './layout'
-import { layoutReplaceTextFlow, replaceTextVerticalOffset, selectedGroupsText, type ReplaceTextFlowSlotLayout } from './replaceTextLayout'
+import { layoutReplaceTextFlow, normalizeReplaceParagraph, replaceTextVerticalOffset, selectedGroupsText, type ReplaceTextFlowSlotLayout } from './replaceTextLayout'
+import { calibrateReplaceFontPx } from './replaceTextRenderer'
 import type { CapturedFrame } from './types'
 
 type ReplaceTranslateOverlayProps = {
@@ -22,6 +23,8 @@ type ReplaceTranslateOverlayProps = {
 }
 
 type SelectionRect = { x1: number; y1: number; x2: number; y2: number }
+
+const REPLACE_FONT_FAMILY = 'system-ui, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif'
 
 function normalizedRect(selection: SelectionRect) {
   return {
@@ -66,7 +69,7 @@ function drawNormalSlotText(
 ) {
   const { bounds } = slot
   const innerHeight = Math.max(1, bounds.height - padding * 2)
-  ctx.font = `${fontPx}px system-ui, "Segoe UI", sans-serif`
+  ctx.font = `${fontPx}px ${REPLACE_FONT_FAMILY}`
   ctx.fillStyle = slot.sourceColor
   ctx.textBaseline = 'top'
   ctx.textAlign = slot.align
@@ -94,7 +97,7 @@ function drawSafelyScaledSlotText(
   if (!offscreenCtx) return
   const virtualPadding = padding / safeScale
   const innerHeight = Math.max(1, offscreen.height - virtualPadding * 2)
-  offscreenCtx.font = `${fontPx}px system-ui, "Segoe UI", sans-serif`
+  offscreenCtx.font = `${fontPx}px ${REPLACE_FONT_FAMILY}`
   offscreenCtx.fillStyle = slot.sourceColor
   offscreenCtx.textBaseline = 'top'
   offscreenCtx.textAlign = slot.align
@@ -178,19 +181,34 @@ export function ReplaceTranslateOverlay({
         const groupSlots = (slotsByGroup.get(group.id) ?? [])
           .sort((left, right) => left.anchor.y - right.anchor.y || left.anchor.x - right.anchor.x)
         if (groupSlots.length === 0) continue
-        const text = group.translated.trim() || group.sourceText
+        const rawText = group.translated.trim() || group.sourceText
+        const text = groupSlots.some(slot => slot.flow === 'paragraph_flow')
+          ? normalizeReplaceParagraph(rawText)
+          : rawText.replace(/\r\n?/g, '\n')
         if (!text) continue
-        const sourceFontPx = Math.max(...groupSlots.map(slot => slot.sourceFontPx))
-        const padding = Math.max(2, Math.min(6, sourceFontPx * 0.2))
+
+        // Rust's sourceFontPx is the measured source *ink* height. Canvas font
+        // size is an em-box, so calibrate it before fitting; using the ink value
+        // directly made translated text systematically smaller than the source.
+        const sourceInkPx = Math.max(...groupSlots.map(slot => slot.sourceFontPx))
+        const sourceFontPx = calibrateReplaceFontPx(context, sourceInkPx, text.slice(0, 96))
+        const isSourceLineFlow = groupSlots.every(slot => slot.flow === 'paragraph_flow' || slot.flow === 'exact_line')
+        const padding = isSourceLineFlow ? 0 : Math.max(2, Math.min(6, sourceFontPx * 0.2))
         const layout = layoutReplaceTextFlow(
           text,
-          groupSlots.map(slot => ({
-            width: Math.max(1, slot.bounds.width - padding * 2),
-            height: Math.max(1, slot.bounds.height - padding * 2),
-          })),
+          groupSlots.map(slot => {
+            const leftInset = slot.align === 'left'
+              ? Math.max(0, slot.anchor.x - slot.bounds.x)
+              : padding
+            return {
+              width: Math.max(1, slot.bounds.width - leftInset - padding),
+              height: Math.max(1, slot.bounds.height - padding * 2),
+              maxLines: slot.flow === 'paragraph_flow' || slot.flow === 'exact_line' ? 1 : undefined,
+            }
+          }),
           sourceFontPx,
           (value, fontPx) => {
-            context.font = `${fontPx}px system-ui, "Segoe UI", sans-serif`
+            context.font = `${fontPx}px ${REPLACE_FONT_FAMILY}`
             return context.measureText(value).width
           },
         )
