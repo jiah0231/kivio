@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest'
 import {
   layoutReplaceTextFlow,
   normalizeReplaceParagraph,
+  type ReplaceTextFlowLayout,
 } from './replaceTextLayout'
 import {
   calibrateReplaceFontPx,
+  compactReplaceParagraphRenderSlots,
   replaceGroupSourceInkPx,
+  replaceParagraphContinuationShift,
   replaceSlotContentBox,
 } from './replaceTextRenderer'
 import type { LensReplaceRenderSlot } from '../api/tauri'
@@ -41,6 +44,36 @@ function slot(flow: LensReplaceRenderSlot['flow'], index = 0): LensReplaceRender
     verticalAlign: 'top',
     sourceFontPx: 20,
     sourceColor: '#111827',
+  }
+}
+
+function slotAt(flow: LensReplaceRenderSlot['flow'], index: number, y: number, groupId = 'r0') {
+  const base = slot(flow, index)
+  const dy = y - base.bounds.y
+  return {
+    ...base,
+    id: `${groupId}-s${String(index).padStart(2, '0')}`,
+    groupId,
+    bounds: { ...base.bounds, y },
+    anchor: {
+      ...base.anchor,
+      y: base.anchor.y + dy,
+      baselineY: base.anchor.baselineY + dy,
+    },
+  }
+}
+
+function fakeLayout(lineFlags: boolean[]): ReplaceTextFlowLayout {
+  return {
+    fontPx: 30,
+    lineHeight: 35.4,
+    safeScale: 1,
+    complete: true,
+    slots: lineFlags.map(hasLine => ({
+      lines: hasLine ? ['译文'] : [],
+      contentWidth: hasLine ? 60 : 0,
+      contentHeight: hasLine ? 35.4 : 0,
+    })),
   }
 }
 
@@ -110,6 +143,65 @@ describe('replacement translation source typography', () => {
 
   it('does not geometry-boost standalone exact-line labels', () => {
     expect(replaceGroupSourceInkPx([slot('exact_line')])).toBe(20)
+  })
+})
+
+describe('replacement translation paragraph compaction', () => {
+  it('removes a detector outlier gap inside one continuous paragraph', () => {
+    const paragraphSlots = [
+      slotAt('paragraph_flow', 0, 20),
+      slotAt('paragraph_flow', 1, 62),
+      slotAt('paragraph_flow', 2, 180),
+      slotAt('paragraph_flow', 3, 222),
+    ]
+    const compacted = compactReplaceParagraphRenderSlots(
+      paragraphSlots,
+      fakeLayout([true, true, true, true]),
+    )
+
+    expect(compacted.map(item => item.anchor.y)).toEqual([22, 64, 106, 148])
+  })
+
+  it('pulls the next body paragraph up by unused translated source rows while preserving its real gap', () => {
+    const previousSource = [
+      slotAt('paragraph_flow', 0, 20),
+      slotAt('paragraph_flow', 1, 62),
+      slotAt('paragraph_flow', 2, 104),
+      slotAt('paragraph_flow', 3, 146),
+      slotAt('paragraph_flow', 4, 188),
+    ]
+    const previousLayout = fakeLayout([true, true, true, false, false])
+    const previousRendered = compactReplaceParagraphRenderSlots(previousSource, previousLayout)
+    const currentSource = [
+      slotAt('paragraph_flow', 0, 242, 'r1'),
+      slotAt('paragraph_flow', 1, 284, 'r1'),
+    ]
+
+    const shift = replaceParagraphContinuationShift({
+      sourceSlots: previousSource,
+      renderedSlots: previousRendered,
+      layout: previousLayout,
+      groupShift: 0,
+    }, currentSource)
+
+    expect(shift).toBe(-84)
+    const shiftedCurrentTop = currentSource[0].bounds.y + shift
+    const previousRenderedBottom = previousRendered[2].bounds.y + previousRendered[2].bounds.height
+    expect(shiftedCurrentTop - previousRenderedBottom).toBe(20)
+  })
+
+  it('does not pull a distant paragraph across a real section break', () => {
+    const previousSource = [slotAt('paragraph_flow', 0, 20), slotAt('paragraph_flow', 1, 62)]
+    const previousLayout = fakeLayout([true, false])
+    const previousRendered = compactReplaceParagraphRenderSlots(previousSource, previousLayout)
+    const currentSource = [slotAt('paragraph_flow', 0, 180, 'r1')]
+
+    expect(replaceParagraphContinuationShift({
+      sourceSlots: previousSource,
+      renderedSlots: previousRendered,
+      layout: previousLayout,
+      groupShift: 0,
+    }, currentSource)).toBe(0)
   })
 })
 
