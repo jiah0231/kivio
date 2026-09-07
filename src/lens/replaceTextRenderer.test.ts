@@ -3,7 +3,11 @@ import {
   layoutReplaceTextFlow,
   normalizeReplaceParagraph,
 } from './replaceTextLayout'
-import { calibrateReplaceFontPx, replaceSlotContentBox } from './replaceTextRenderer'
+import {
+  calibrateReplaceFontPx,
+  replaceGroupSourceInkPx,
+  replaceSlotContentBox,
+} from './replaceTextRenderer'
 import type { LensReplaceRenderSlot } from '../api/tauri'
 
 const widthMeasure = (text: string, fontPx: number) => Array.from(text).length * fontPx * 0.5
@@ -24,13 +28,13 @@ function canvasWithInkRatio(ratio = 0.8) {
   return context as unknown as CanvasRenderingContext2D
 }
 
-function slot(flow: LensReplaceRenderSlot['flow']): LensReplaceRenderSlot {
+function slot(flow: LensReplaceRenderSlot['flow'], index = 0): LensReplaceRenderSlot {
   return {
-    id: 'r0-s00',
+    id: `r0-s${String(index).padStart(2, '0')}`,
     groupId: 'r0',
-    leafIds: ['s0'],
-    bounds: { x: 10, y: 20, width: 220, height: 34 },
-    anchor: { x: 14, y: 22, baselineY: 42 },
+    leafIds: [`s${index}`],
+    bounds: { x: 10, y: 20 + index * 42, width: 220, height: 34 },
+    anchor: { x: 14, y: 22 + index * 42, baselineY: 42 + index * 42 },
     flow,
     kind: flow === 'paragraph_flow' ? 'paragraph' : 'line',
     align: 'left',
@@ -71,6 +75,41 @@ describe('replacement translation source typography', () => {
     expect(layout.complete).toBe(true)
     expect(layout.slots.every(item => item.lines.length <= 1)).toBe(true)
     expect(layout.slots.flatMap(item => item.lines).join('')).toBe('第一行第二行第三行第四行')
+  })
+
+  it('lets paragraph text grow toward the source line box instead of leaving blank source rows', () => {
+    const paragraphSlots = Array.from({ length: 9 }, (_, index) => slot('paragraph_flow', index))
+    const context = canvasWithInkRatio(0.8)
+    const reportedInk = 20
+    const geometryInk = replaceGroupSourceInkPx(paragraphSlots)
+    expect(geometryInk).toBeCloseTo(31.28, 2)
+
+    const oldFontPx = calibrateReplaceFontPx(context, reportedInk, '中文段落')
+    const newFontPx = calibrateReplaceFontPx(context, geometryInk, '中文段落')
+    expect(newFontPx).toBeGreaterThan(oldFontPx * 1.4)
+
+    const text = '译'.repeat(110)
+    const oldLayout = layoutReplaceTextFlow(
+      text,
+      paragraphSlots.map(replaceSlotContentBox),
+      oldFontPx,
+      widthMeasure,
+    )
+    const newLayout = layoutReplaceTextFlow(
+      text,
+      paragraphSlots.map(replaceSlotContentBox),
+      newFontPx,
+      widthMeasure,
+    )
+    const usedOldRows = oldLayout.slots.filter(item => item.lines.length > 0).length
+    const usedNewRows = newLayout.slots.filter(item => item.lines.length > 0).length
+    expect(newLayout.complete).toBe(true)
+    expect(usedNewRows).toBeGreaterThan(usedOldRows)
+    expect(usedNewRows).toBeGreaterThanOrEqual(8)
+  })
+
+  it('does not geometry-boost standalone exact-line labels', () => {
+    expect(replaceGroupSourceInkPx([slot('exact_line')])).toBe(20)
   })
 })
 
