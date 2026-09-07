@@ -4,7 +4,9 @@ export type TextBounds = { width: number; height: number }
 
 export type TextMeasure = (text: string, fontPx: number) => number
 
-export type ReplaceTextFlowSlot = TextBounds
+// Paragraph / exact-line slots represent one source baseline. `maxLines` keeps
+// a smaller translated font from inventing extra baselines inside that slot.
+export type ReplaceTextFlowSlot = TextBounds & { maxLines?: number }
 
 export type ReplaceTextFlowSlotLayout = {
   lines: string[]
@@ -32,6 +34,33 @@ export function replaceTextVerticalOffset(
 }
 
 const CJK = /[\u2e80-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/
+const CJK_PUNCTUATION = /[\u3000-\u303f\uff00-\uffef“”‘’]/
+const CLOSING_PUNCTUATION = /^[，。、；：？！）】》〉」』”’％]/
+
+/**
+ * A paragraph group is translated as one semantic unit. OCR/model line breaks
+ * inside it are therefore soft wraps, not layout instructions. Keeping those
+ * newlines made the renderer consume empty source slots and produced the large
+ * vertical holes visible in replacement translation screenshots.
+ */
+export function normalizeReplaceParagraph(text: string): string {
+  const lines = text
+    .replace(/\r\n?/g, '\n')
+    .split(/\n+/)
+    .map(line => line.trim())
+    .filter(Boolean)
+
+  return lines.reduce((output, line) => {
+    if (!output) return line
+    const last = Array.from(output).at(-1) ?? ''
+    const first = Array.from(line)[0] ?? ''
+    const joinWithoutSpace =
+      output.endsWith('-')
+      || ((CJK.test(last) || CJK_PUNCTUATION.test(last))
+        && (CJK.test(first) || CJK_PUNCTUATION.test(first)))
+    return output + (joinWithoutSpace ? '' : ' ') + line
+  }, '')
+}
 
 export function tokenizeReplaceText(text: string): string[] {
   const tokens: string[] = []
@@ -44,7 +73,7 @@ export function tokenizeReplaceText(text: string): string[] {
     if (char === '\n') {
       flushLatin()
       tokens.push('\n')
-    } else if (CJK.test(char)) {
+    } else if (CJK.test(char) || CJK_PUNCTUATION.test(char)) {
       flushLatin()
       tokens.push(char)
     } else if (/\s/.test(char)) {
@@ -83,6 +112,15 @@ function takeReplaceFlowLine(
         continue
       }
     }
+
+    // Do not strand a Chinese/Japanese closing punctuation mark at the start of
+    // the next line. One punctuation glyph of controlled overhang is visually
+    // much closer to normal document layout than a leading comma/period.
+    if (current && CLOSING_PUNCTUATION.test(token)) {
+      current += token
+      tokens.shift()
+      break
+    }
     if (current) break
 
     let prefix = ''
@@ -114,7 +152,10 @@ function evaluateReplaceTextFlow(
   const layouts = slots.map(slot => {
     const virtualWidth = Math.max(1, slot.width / safeScale)
     const virtualHeight = Math.max(1, slot.height / safeScale)
-    const lineCount = Math.max(1, Math.floor(virtualHeight / lineHeight))
+    const heightLineCount = Math.max(1, Math.floor(virtualHeight / lineHeight))
+    const lineCount = slot.maxLines === undefined
+      ? heightLineCount
+      : Math.max(1, Math.min(heightLineCount, slot.maxLines))
     const lines: string[] = []
     for (let index = 0; index < lineCount && tokens.length > 0; index += 1) {
       lines.push(takeReplaceFlowLine(tokens, virtualWidth, fontPx, measure))
@@ -149,8 +190,11 @@ export function layoutReplaceTextFlow(
   if (slots.length === 0) {
     return { fontPx: preferredMinPx, lineHeight: preferredMinPx * 1.18, safeScale: 1, slots: [], complete: text.length === 0 }
   }
-  const tallest = Math.max(...slots.map(slot => slot.height))
-  const maxFont = Math.max(preferredMinPx, Math.min(sourceFontPx || 16, tallest * 0.82, 48))
+
+  // `sourceFontPx` is already derived from OCR source geometry. Do not cap it
+  // at 48px (large headings / high-DPI captures were visibly shrunk), and do
+  // not multiply by slot height again — that double-applied the shrink.
+  const maxFont = Math.max(preferredMinPx, sourceFontPx || 16)
   let low = preferredMinPx
   let high = maxFont
   let best: ReplaceTextFlowLayout | null = null
