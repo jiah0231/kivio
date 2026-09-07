@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/replacement-translation-layout
+      - fix/replacement-translation-layout-b2
   workflow_dispatch:
 
 permissions:
@@ -53,15 +54,22 @@ jobs:
 
       - name: Package portable zip
         shell: pwsh
-        run: ./scripts/package-windows-portable.ps1 -Version 2.9.6-layout-fix
+        run: ./scripts/package-windows-portable.ps1 -Version 2.9.6-layout-b2
+
+      - name: Rename B2 installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer missing' }
+          Rename-Item -LiteralPath $installer.FullName -NewName 'Kivio-Desktop_2.9.6-layout-b2_x64-setup.exe'
 
       - name: Verify artifacts
         shell: pwsh
         run: |
-          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*.exe' | Select-Object -First 1
-          $portable = Get-ChildItem 'src-tauri/target/release/bundle/portable' -Filter '*.zip' | Select-Object -First 1
-          if (-not $installer) { throw 'NSIS installer missing' }
-          if (-not $portable) { throw 'portable zip missing' }
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis' -Filter '*layout-b2*.exe' | Select-Object -First 1
+          $portable = Get-ChildItem 'src-tauri/target/release/bundle/portable' -Filter '*layout-b2*.zip' | Select-Object -First 1
+          if (-not $installer) { throw 'B2 NSIS installer missing' }
+          if (-not $portable) { throw 'B2 portable zip missing' }
           Write-Host "Installer: $($installer.FullName) ($($installer.Length) bytes)"
           Write-Host "Portable: $($portable.FullName) ($($portable.Length) bytes)"
           Get-FileHash -Algorithm SHA256 $installer.FullName
@@ -70,8 +78,8 @@ jobs:
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
-          name: Kivio-Desktop-2.9.6-layout-fix-windows-x64
+          name: Kivio-Desktop-2.9.6-layout-b2-windows-x64
           if-no-files-found: error
           path: |
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/portable/*.zip
+            src-tauri/target/release/bundle/nsis/*layout-b2*.exe
+            src-tauri/target/release/bundle/portable/*layout-b2*.zip
