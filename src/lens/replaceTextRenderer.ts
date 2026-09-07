@@ -388,7 +388,7 @@ export function renderReplaceTextGroups(
       },
     )
 
-    const groupShift = previousParagraph
+    const groupShift: number = previousParagraph
       ? replaceParagraphContinuationShift(previousParagraph, groupSlots, group.sourceText)
       : 0
     const renderSlots = compactReplaceParagraphRenderSlots(groupSlots, layout, groupShift)
