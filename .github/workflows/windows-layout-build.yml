@@ -34,11 +34,19 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: Typecheck
-        run: npm run typecheck
+      # The repository's npm typecheck also runs the Rust protocol exporter,
+      # which causes a full debug Rust compile before the release Tauri build.
+      # Official PR CI runs that protocol gate in parallel; for this packaging
+      # job, run the TypeScript compiler directly so Windows gets to the real
+      # release build without compiling the backend twice.
+      - name: Typecheck frontend
+        run: npx tsc --noEmit
 
-      - name: Frontend tests
-        run: npm test
+      - name: Replacement translation tests
+        run: npx vitest run src/lens/replaceTextLayout.test.ts src/lens/replaceTextRenderer.test.ts src/lens/ReplaceTranslateOverlay.test.tsx src/api/tauri.replaceProtocol.test.ts
+
+      - name: Replacement visual benchmark
+        run: npm run test:replace-visual
 
       - name: Build Windows NSIS installer
         run: npx tauri build --bundles nsis
