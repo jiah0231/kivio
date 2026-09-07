@@ -206,23 +206,35 @@ function usedRenderedBottom(slots: LensReplaceRenderSlot[], layout: ReplaceTextF
   return bottoms.length > 0 ? Math.max(...bottoms) : Number.NEGATIVE_INFINITY
 }
 
+function sourceTextClearlyContinues(previousText: string, currentText: string) {
+  const previous = previousText.trim()
+  const current = currentText.trim()
+  if (!previous || !current) return false
+  const withoutClosers = previous.replace(/[\s"'’”）)\]}>]+$/g, '')
+  return !/[.!?。！？]$/.test(withoutClosers)
+}
+
 type PreviousParagraphPlan = {
   sourceSlots: LensReplaceRenderSlot[]
   renderedSlots: LensReplaceRenderSlot[]
   layout: ReplaceTextFlowLayout
   groupShift: number
+  sourceText?: string
 }
 
 /**
  * Chinese translations are often shorter than English. If a paragraph uses
  * only the first N of M source rows, keeping the next paragraph at its original
- * absolute y leaves M-N empty rows on screen. Preserve the *original paragraph
- * gap* but remove the unused tail rows. This is intentionally limited to the
- * same text column and to nearby body blocks so menus/tables never get reflowed.
+ * absolute y leaves M-N empty rows on screen. Preserve the real paragraph gap
+ * but remove the unused tail rows. OCR can also falsely split one sentence into
+ * two groups around math/superscripts; when the source text has no sentence-end
+ * punctuation, cap that false inter-group gap to a normal paragraph spacing.
+ * This stays limited to the same text column so menus/tables are not reflowed.
  */
 export function replaceParagraphContinuationShift(
   previous: PreviousParagraphPlan,
   currentSlots: LensReplaceRenderSlot[],
+  currentSourceText = '',
 ): number {
   if (!isParagraphGroup(previous.sourceSlots) || currentSlots.length === 0) return 0
 
@@ -240,7 +252,9 @@ export function replaceParagraphContinuationShift(
     ...currentSlots.map(slot => slot.bounds.height),
   ]) ?? 1
   const rawGap = sourceBounds(currentSlots).top - sourceBounds(previous.sourceSlots).bottom
-  if (rawGap < -lineBox * 0.35 || rawGap > lineBox * 1.6) return 0
+  const textContinues = sourceTextClearlyContinues(previous.sourceText ?? '', currentSourceText)
+  const maxAllowedGap = textContinues ? lineBox * 3.4 : lineBox * 1.6
+  if (rawGap < -lineBox * 0.35 || rawGap > maxAllowedGap) return 0
   if (Math.abs(previousLast.anchor.x - currentFirst.anchor.x) > lineBox * 1.8) return 0
   if (horizontalOverlapRatio(previousLast, currentFirst) < 0.55) return 0
 
@@ -248,7 +262,9 @@ export function replaceParagraphContinuationShift(
   if (!Number.isFinite(renderedBottom)) return previous.groupShift
   const shiftedSourceBottom = sourceBounds(previous.sourceSlots).bottom + previous.groupShift
   const unusedTail = Math.max(0, shiftedSourceBottom - renderedBottom)
-  return previous.groupShift - unusedTail
+  const desiredGap = textContinues ? Math.min(rawGap, lineBox * 0.65) : rawGap
+  const oversizedFalseGap = Math.max(0, rawGap - desiredGap)
+  return previous.groupShift - unusedTail - oversizedFalseGap
 }
 
 function contentBlockHeight(
@@ -373,7 +389,7 @@ export function renderReplaceTextGroups(
     )
 
     const groupShift = previousParagraph
-      ? replaceParagraphContinuationShift(previousParagraph, groupSlots)
+      ? replaceParagraphContinuationShift(previousParagraph, groupSlots, group.sourceText)
       : 0
     const renderSlots = compactReplaceParagraphRenderSlots(groupSlots, layout, groupShift)
 
@@ -395,8 +411,9 @@ export function renderReplaceTextGroups(
         renderedSlots: renderSlots,
         layout,
         groupShift,
+        sourceText: group.sourceText,
       }
-    } else if (!(previousParagraph && groupShift !== 0)) {
+    } else {
       previousParagraph = null
     }
   }
